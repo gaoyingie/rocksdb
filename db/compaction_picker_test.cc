@@ -119,7 +119,7 @@ class CompactionPickerTest : public testing::Test {
     vstorage_->UpdateNumNonEmptyLevels();
     vstorage_->GenerateFileIndexer();
     vstorage_->GenerateLevelFilesBrief();
-    vstorage_->ComputeCompactionScore(mutable_cf_options_, fifo_options_);
+    vstorage_->ComputeCompactionScore(mutable_cf_options_);
     vstorage_->GenerateLevel0NonOverlapping();
     vstorage_->SetFinalized();
   }
@@ -467,7 +467,6 @@ TEST_F(CompactionPickerTest, NeedsCompactionFIFO) {
   fifo_options_.max_table_files_size = kMaxSize;
   ioptions_.compaction_options_fifo = fifo_options_;
   FIFOCompactionPicker fifo_compaction_picker(ioptions_, &icmp_);
-
   UpdateVersionStorageInfo();
   // must return false when there's no files.
   ASSERT_EQ(fifo_compaction_picker.NeedsCompaction(vstorage_.get()), false);

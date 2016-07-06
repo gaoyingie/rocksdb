@@ -800,9 +800,10 @@ class DB {
   // Current Requirements:
   // (1) Key range in loaded table file don't overlap with
   //     existing keys or tombstones in DB.
-  // (2) No other writes happen during AddFile call, otherwise
-  //     DB may get corrupted.
-  // (3) No snapshots are held.
+  // (2) No snapshots are held.
+  //
+  // Notes: We will try to ingest the file to the lowest possible level
+  //        even if the file compression dont match the level compression
   virtual Status AddFile(ColumnFamilyHandle* column_family,
                          const std::string& file_path,
                          bool move_file = false) = 0;
@@ -858,7 +859,24 @@ Status DestroyDB(const std::string& name, const Options& options);
 // resurrect as much of the contents of the database as possible.
 // Some data may be lost, so be careful when calling this function
 // on a database that contains important information.
+//
+// With this API, we will warn and skip data associated with column families not
+// specified in column_families.
+//
+// @param column_families Descriptors for known column families
+Status RepairDB(const std::string& dbname, const DBOptions& db_options,
+                const std::vector<ColumnFamilyDescriptor>& column_families);
+
+// @param unknown_cf_opts Options for column families encountered during the
+//                        repair that were not specified in column_families.
+Status RepairDB(const std::string& dbname, const DBOptions& db_options,
+                const std::vector<ColumnFamilyDescriptor>& column_families,
+                const ColumnFamilyOptions& unknown_cf_opts);
+
+// @param options These options will be used for the database and for ALL column
+//                families encountered during the repair
 Status RepairDB(const std::string& dbname, const Options& options);
+
 #endif
 
 }  // namespace rocksdb

@@ -56,3 +56,12 @@ Pinterest's Object Retrieval System uses RocksDB for storage: https://www.youtub
 ## quasardb
 [quasardb](https://www.quasardb.net) is a high-performance, distributed, transactional key-value database that integrates well with in-memory analytics engines such as Apache Spark. 
 quasardb uses a heavily tuned RocksDB as its persistence layer.
+
+## Netflix
+[Netflix](http://techblog.netflix.com/2016/05/application-data-caching-using-ssds.html) uses RocksDB on spinning disks to cache application data.
+
+## TiKV
+[TiKV](https://github.com/pingcap/tikv) is a GEO-replicated, high-performance, distributed, transactional key-value database. TiKV is powered by Rust and Raft. TiKV uses RocksDB as its persistence layer.
+
+## Apache Flink
+[Apache Flink](https://flink.apache.org/news/2016/03/08/release-1.0.0.html) uses RocksDB to store state locally on a machine.

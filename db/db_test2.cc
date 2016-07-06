@@ -7,8 +7,10 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file. See the AUTHORS file for names of contributors.
 #include <cstdlib>
+
 #include "db/db_test_util.h"
 #include "port/stack_trace.h"
+#include "rocksdb/persistent_cache.h"
 #include "rocksdb/wal_filter.h"
 
 namespace rocksdb {
@@ -142,6 +144,225 @@ TEST_F(DBTest2, CacheIndexAndFilterWithDBRestart) {
 }
 
 #ifndef ROCKSDB_LITE
+class DBTestSharedWriteBufferAcrossCFs
+    : public DBTestBase,
+      public testing::WithParamInterface<bool> {
+ public:
+  DBTestSharedWriteBufferAcrossCFs()
+      : DBTestBase("/db_test_shared_write_buffer") {}
+  void SetUp() override { use_old_interface_ = GetParam(); }
+  bool use_old_interface_;
+};
+
+TEST_P(DBTestSharedWriteBufferAcrossCFs, SharedWriteBufferAcrossCFs) {
+  Options options = CurrentOptions();
+  if (use_old_interface_) {
+    options.db_write_buffer_size = 100000;  // this is the real limit
+  } else {
+    options.write_buffer_manager.reset(new WriteBufferManager(100000));
+  }
+  options.write_buffer_size = 500000;  // this is never hit
+  CreateAndReopenWithCF({"pikachu", "dobrynia", "nikitich"}, options);
+
+  // Trigger a flush on CF "nikitich"
+  ASSERT_OK(Put(0, Key(1), DummyString(1)));
+  ASSERT_OK(Put(1, Key(1), DummyString(1)));
+  ASSERT_OK(Put(3, Key(1), DummyString(90000)));
+  ASSERT_OK(Put(2, Key(2), DummyString(20000)));
+  ASSERT_OK(Put(2, Key(1), DummyString(1)));
+  dbfull()->TEST_WaitForFlushMemTable(handles_[0]);
+  dbfull()->TEST_WaitForFlushMemTable(handles_[1]);
+  dbfull()->TEST_WaitForFlushMemTable(handles_[2]);
+  dbfull()->TEST_WaitForFlushMemTable(handles_[3]);
+  {
+    ASSERT_EQ(GetNumberOfSstFilesForColumnFamily(db_, "default"),
+              static_cast<uint64_t>(0));
+    ASSERT_EQ(GetNumberOfSstFilesForColumnFamily(db_, "pikachu"),
+              static_cast<uint64_t>(0));
+    ASSERT_EQ(GetNumberOfSstFilesForColumnFamily(db_, "dobrynia"),
+              static_cast<uint64_t>(0));
+    ASSERT_EQ(GetNumberOfSstFilesForColumnFamily(db_, "nikitich"),
+              static_cast<uint64_t>(1));
+  }
+
+  // "dobrynia": 20KB
+  // Flush 'dobrynia'
+  ASSERT_OK(Put(3, Key(2), DummyString(40000)));
+  ASSERT_OK(Put(2, Key(2), DummyString(70000)));
+  ASSERT_OK(Put(0, Key(1), DummyString(1)));
+  dbfull()->TEST_WaitForFlushMemTable(handles_[1]);
+  dbfull()->TEST_WaitForFlushMemTable(handles_[2]);
+  dbfull()->TEST_WaitForFlushMemTable(handles_[3]);
+  {
+    ASSERT_EQ(GetNumberOfSstFilesForColumnFamily(db_, "default"),
+              static_cast<uint64_t>(0));
+    ASSERT_EQ(GetNumberOfSstFilesForColumnFamily(db_, "pikachu"),
+              static_cast<uint64_t>(0));
+    ASSERT_EQ(GetNumberOfSstFilesForColumnFamily(db_, "dobrynia"),
+              static_cast<uint64_t>(1));
+    ASSERT_EQ(GetNumberOfSstFilesForColumnFamily(db_, "nikitich"),
+              static_cast<uint64_t>(1));
+  }
+
+  // "nikitich" still has data of 80KB
+  // Inserting Data in "dobrynia" triggers "nikitich" flushing.
+  ASSERT_OK(Put(3, Key(2), DummyString(40000)));
+  ASSERT_OK(Put(2, Key(2), DummyString(40000)));
+  ASSERT_OK(Put(0, Key(1), DummyString(1)));
+  dbfull()->TEST_WaitForFlushMemTable(handles_[1]);
+  dbfull()->TEST_WaitForFlushMemTable(handles_[2]);
+  dbfull()->TEST_WaitForFlushMemTable(handles_[3]);
+  {
+    ASSERT_EQ(GetNumberOfSstFilesForColumnFamily(db_, "default"),
+              static_cast<uint64_t>(0));
+    ASSERT_EQ(GetNumberOfSstFilesForColumnFamily(db_, "pikachu"),
+              static_cast<uint64_t>(0));
+    ASSERT_EQ(GetNumberOfSstFilesForColumnFamily(db_, "dobrynia"),
+              static_cast<uint64_t>(1));
+    ASSERT_EQ(GetNumberOfSstFilesForColumnFamily(db_, "nikitich"),
+              static_cast<uint64_t>(2));
+  }
+
+  // "dobrynia" still has 40KB
+  ASSERT_OK(Put(1, Key(2), DummyString(20000)));
+  ASSERT_OK(Put(0, Key(1), DummyString(10000)));
+  ASSERT_OK(Put(0, Key(1), DummyString(1)));
+  dbfull()->TEST_WaitForFlushMemTable(handles_[0]);
+  dbfull()->TEST_WaitForFlushMemTable(handles_[1]);
+  dbfull()->TEST_WaitForFlushMemTable(handles_[2]);
+  dbfull()->TEST_WaitForFlushMemTable(handles_[3]);
+  // This should triggers no flush
+  {
+    ASSERT_EQ(GetNumberOfSstFilesForColumnFamily(db_, "default"),
+              static_cast<uint64_t>(0));
+    ASSERT_EQ(GetNumberOfSstFilesForColumnFamily(db_, "pikachu"),
+              static_cast<uint64_t>(0));
+    ASSERT_EQ(GetNumberOfSstFilesForColumnFamily(db_, "dobrynia"),
+              static_cast<uint64_t>(1));
+    ASSERT_EQ(GetNumberOfSstFilesForColumnFamily(db_, "nikitich"),
+              static_cast<uint64_t>(2));
+  }
+
+  // "default": 10KB, "pikachu": 20KB, "dobrynia": 40KB
+  ASSERT_OK(Put(1, Key(2), DummyString(40000)));
+  ASSERT_OK(Put(0, Key(1), DummyString(1)));
+  dbfull()->TEST_WaitForFlushMemTable(handles_[0]);
+  dbfull()->TEST_WaitForFlushMemTable(handles_[1]);
+  dbfull()->TEST_WaitForFlushMemTable(handles_[2]);
+  dbfull()->TEST_WaitForFlushMemTable(handles_[3]);
+  // This should triggers flush of "pikachu"
+  {
+    ASSERT_EQ(GetNumberOfSstFilesForColumnFamily(db_, "default"),
+              static_cast<uint64_t>(0));
+    ASSERT_EQ(GetNumberOfSstFilesForColumnFamily(db_, "pikachu"),
+              static_cast<uint64_t>(1));
+    ASSERT_EQ(GetNumberOfSstFilesForColumnFamily(db_, "dobrynia"),
+              static_cast<uint64_t>(1));
+    ASSERT_EQ(GetNumberOfSstFilesForColumnFamily(db_, "nikitich"),
+              static_cast<uint64_t>(2));
+  }
+
+  // "default": 10KB, "dobrynia": 40KB
+  // Some remaining writes so 'default', 'dobrynia' and 'nikitich' flush on
+  // closure.
+  ASSERT_OK(Put(3, Key(1), DummyString(1)));
+  ReopenWithColumnFamilies({"default", "pikachu", "dobrynia", "nikitich"},
+                           options);
+  {
+    ASSERT_EQ(GetNumberOfSstFilesForColumnFamily(db_, "default"),
+              static_cast<uint64_t>(1));
+    ASSERT_EQ(GetNumberOfSstFilesForColumnFamily(db_, "pikachu"),
+              static_cast<uint64_t>(1));
+    ASSERT_EQ(GetNumberOfSstFilesForColumnFamily(db_, "dobrynia"),
+              static_cast<uint64_t>(2));
+    ASSERT_EQ(GetNumberOfSstFilesForColumnFamily(db_, "nikitich"),
+              static_cast<uint64_t>(3));
+  }
+}
+
+INSTANTIATE_TEST_CASE_P(DBTestSharedWriteBufferAcrossCFs,
+                        DBTestSharedWriteBufferAcrossCFs, ::testing::Bool());
+
+TEST_F(DBTest2, SharedWriteBufferLimitAcrossDB) {
+  std::string dbname2 = test::TmpDir(env_) + "/db_shared_wb_db2";
+  Options options = CurrentOptions();
+  options.write_buffer_size = 500000;  // this is never hit
+  options.write_buffer_manager.reset(new WriteBufferManager(100000));
+  CreateAndReopenWithCF({"cf1", "cf2"}, options);
+
+  ASSERT_OK(DestroyDB(dbname2, options));
+  DB* db2 = nullptr;
+  ASSERT_OK(DB::Open(options, dbname2, &db2));
+
+  WriteOptions wo;
+
+  // Trigger a flush on cf2
+  ASSERT_OK(Put(0, Key(1), DummyString(1)));
+  ASSERT_OK(Put(1, Key(1), DummyString(1)));
+  ASSERT_OK(Put(2, Key(1), DummyString(90000)));
+
+  // Insert to DB2
+  ASSERT_OK(db2->Put(wo, Key(2), DummyString(20000)));
+
+  ASSERT_OK(Put(2, Key(1), DummyString(1)));
+  dbfull()->TEST_WaitForFlushMemTable(handles_[0]);
+  dbfull()->TEST_WaitForFlushMemTable(handles_[1]);
+  dbfull()->TEST_WaitForFlushMemTable(handles_[2]);
+  static_cast<DBImpl*>(db2)->TEST_WaitForFlushMemTable();
+  {
+    ASSERT_EQ(GetNumberOfSstFilesForColumnFamily(db_, "default"),
+              static_cast<uint64_t>(0));
+    ASSERT_EQ(GetNumberOfSstFilesForColumnFamily(db_, "cf1"),
+              static_cast<uint64_t>(0));
+    ASSERT_EQ(GetNumberOfSstFilesForColumnFamily(db_, "cf2"),
+              static_cast<uint64_t>(1));
+    ASSERT_EQ(GetNumberOfSstFilesForColumnFamily(db2, "default"),
+              static_cast<uint64_t>(0));
+  }
+
+  // db2: 20KB
+  ASSERT_OK(db2->Put(wo, Key(2), DummyString(40000)));
+  ASSERT_OK(db2->Put(wo, Key(3), DummyString(70000)));
+  ASSERT_OK(db2->Put(wo, Key(1), DummyString(1)));
+  dbfull()->TEST_WaitForFlushMemTable(handles_[0]);
+  dbfull()->TEST_WaitForFlushMemTable(handles_[1]);
+  dbfull()->TEST_WaitForFlushMemTable(handles_[2]);
+  static_cast<DBImpl*>(db2)->TEST_WaitForFlushMemTable();
+  {
+    ASSERT_EQ(GetNumberOfSstFilesForColumnFamily(db_, "default"),
+              static_cast<uint64_t>(0));
+    ASSERT_EQ(GetNumberOfSstFilesForColumnFamily(db_, "cf1"),
+              static_cast<uint64_t>(0));
+    ASSERT_EQ(GetNumberOfSstFilesForColumnFamily(db_, "cf2"),
+              static_cast<uint64_t>(1));
+    ASSERT_EQ(GetNumberOfSstFilesForColumnFamily(db2, "default"),
+              static_cast<uint64_t>(1));
+  }
+
+  //
+  // Inserting Data in db2 and db_ triggers flushing in db_.
+  ASSERT_OK(db2->Put(wo, Key(3), DummyString(70000)));
+  ASSERT_OK(Put(2, Key(2), DummyString(45000)));
+  ASSERT_OK(Put(0, Key(1), DummyString(1)));
+  dbfull()->TEST_WaitForFlushMemTable(handles_[0]);
+  dbfull()->TEST_WaitForFlushMemTable(handles_[1]);
+  dbfull()->TEST_WaitForFlushMemTable(handles_[2]);
+  static_cast<DBImpl*>(db2)->TEST_WaitForFlushMemTable();
+  {
+    ASSERT_EQ(GetNumberOfSstFilesForColumnFamily(db_, "default"),
+              static_cast<uint64_t>(0));
+    ASSERT_EQ(GetNumberOfSstFilesForColumnFamily(db_, "cf1"),
+              static_cast<uint64_t>(0));
+    ASSERT_EQ(GetNumberOfSstFilesForColumnFamily(db_, "cf2"),
+              static_cast<uint64_t>(2));
+    ASSERT_EQ(GetNumberOfSstFilesForColumnFamily(db2, "default"),
+              static_cast<uint64_t>(1));
+  }
+
+  delete db2;
+  ASSERT_OK(DestroyDB(dbname2, options));
+}
+
 namespace {
   void ValidateKeyExistence(DB* db, const std::vector<Slice>& keys_must_exist,
     const std::vector<Slice>& keys_must_not_exist) {
@@ -895,6 +1116,75 @@ TEST_F(DBTest2, CompressionOptions) {
     ASSERT_EQ(listener->max_level_checked, 6);
   }
 }
+
+class CompactionStallTestListener : public EventListener {
+ public:
+  CompactionStallTestListener() : compacted_files_cnt_(0) {}
+
+  void OnCompactionCompleted(DB* db, const CompactionJobInfo& ci) override {
+    ASSERT_EQ(ci.cf_name, "default");
+    ASSERT_EQ(ci.base_input_level, 0);
+    ASSERT_EQ(ci.compaction_reason, CompactionReason::kLevelL0FilesNum);
+    compacted_files_cnt_ += ci.input_files.size();
+  }
+  std::atomic<size_t> compacted_files_cnt_;
+};
+
+TEST_F(DBTest2, CompactionStall) {
+  rocksdb::SyncPoint::GetInstance()->LoadDependency(
+      {{"DBImpl::BGWorkCompaction", "DBTest2::CompactionStall:0"},
+       {"DBImpl::BGWorkCompaction", "DBTest2::CompactionStall:1"},
+       {"DBTest2::CompactionStall:2",
+        "DBImpl::NotifyOnCompactionCompleted::UnlockMutex"}});
+  rocksdb::SyncPoint::GetInstance()->EnableProcessing();
+
+  Options options = CurrentOptions();
+  options.level0_file_num_compaction_trigger = 4;
+  options.max_background_compactions = 40;
+  CompactionStallTestListener* listener = new CompactionStallTestListener();
+  options.listeners.emplace_back(listener);
+  DestroyAndReopen(options);
+
+  Random rnd(301);
+
+  // 4 Files in L0
+  for (int i = 0; i < 4; i++) {
+    for (int j = 0; j < 10; j++) {
+      ASSERT_OK(Put(RandomString(&rnd, 10), RandomString(&rnd, 10)));
+    }
+    ASSERT_OK(Flush());
+  }
+
+  // Wait for compaction to be triggered
+  TEST_SYNC_POINT("DBTest2::CompactionStall:0");
+
+  // Clear "DBImpl::BGWorkCompaction" SYNC_POINT since we want to hold it again
+  // at DBTest2::CompactionStall::1
+  rocksdb::SyncPoint::GetInstance()->ClearTrace();
+
+  // Another 6 L0 files to trigger compaction again
+  for (int i = 0; i < 6; i++) {
+    for (int j = 0; j < 10; j++) {
+      ASSERT_OK(Put(RandomString(&rnd, 10), RandomString(&rnd, 10)));
+    }
+    ASSERT_OK(Flush());
+  }
+
+  // Wait for another compaction to be triggered
+  TEST_SYNC_POINT("DBTest2::CompactionStall:1");
+
+  // Hold NotifyOnCompactionCompleted in the unlock mutex section
+  TEST_SYNC_POINT("DBTest2::CompactionStall:2");
+
+  dbfull()->TEST_WaitForCompact();
+  ASSERT_LT(NumTableFilesAtLevel(0),
+            options.level0_file_num_compaction_trigger);
+  ASSERT_GT(listener->compacted_files_cnt_.load(),
+            10 - options.level0_file_num_compaction_trigger);
+
+  rocksdb::SyncPoint::GetInstance()->DisableProcessing();
+}
+
 #endif  // ROCKSDB_LITE
 
 TEST_F(DBTest2, FirstSnapshotTest) {
@@ -1024,7 +1314,131 @@ TEST_P(PinL0IndexAndFilterBlocksTest,
 
 INSTANTIATE_TEST_CASE_P(PinL0IndexAndFilterBlocksTest,
                         PinL0IndexAndFilterBlocksTest, ::testing::Bool());
+#ifndef ROCKSDB_LITE
+static void UniqueIdCallback(void* arg) {
+  int* result = reinterpret_cast<int*>(arg);
+  if (*result == -1) {
+    *result = 0;
+  }
 
+  rocksdb::SyncPoint::GetInstance()->ClearTrace();
+  rocksdb::SyncPoint::GetInstance()->SetCallBack(
+      "GetUniqueIdFromFile:FS_IOC_GETVERSION", UniqueIdCallback);
+}
+
+class MockPersistentCache : public PersistentCache {
+ public:
+  explicit MockPersistentCache(const bool is_compressed, const size_t max_size)
+      : is_compressed_(is_compressed), max_size_(max_size) {
+    rocksdb::SyncPoint::GetInstance()->EnableProcessing();
+    rocksdb::SyncPoint::GetInstance()->SetCallBack(
+        "GetUniqueIdFromFile:FS_IOC_GETVERSION", UniqueIdCallback);
+  }
+
+  virtual ~MockPersistentCache() {}
+
+  Status Insert(const Slice& page_key, const char* data,
+                const size_t size) override {
+    MutexLock _(&lock_);
+
+    if (size_ > max_size_) {
+      size_ -= data_.begin()->second.size();
+      data_.erase(data_.begin());
+    }
+
+    data_.insert(std::make_pair(page_key.ToString(), std::string(data, size)));
+    size_ += size;
+    return Status::OK();
+  }
+
+  Status Lookup(const Slice& page_key, std::unique_ptr<char[]>* data,
+                size_t* size) override {
+    MutexLock _(&lock_);
+    auto it = data_.find(page_key.ToString());
+    if (it == data_.end()) {
+      return Status::NotFound();
+    }
+
+    assert(page_key.ToString() == it->first);
+    data->reset(new char[it->second.size()]);
+    memcpy(data->get(), it->second.c_str(), it->second.size());
+    *size = it->second.size();
+    return Status::OK();
+  }
+
+  bool IsCompressed() override { return is_compressed_; }
+
+  port::Mutex lock_;
+  std::map<std::string, std::string> data_;
+  const bool is_compressed_ = true;
+  size_t size_ = 0;
+  const size_t max_size_ = 10 * 1024;  // 10KiB
+};
+
+TEST_F(DBTest2, PersistentCache) {
+  int num_iter = 80;
+
+  Options options;
+  options.write_buffer_size = 64 * 1024;  // small write buffer
+  options.statistics = rocksdb::CreateDBStatistics();
+  options = CurrentOptions(options);
+
+  auto bsizes = {/*no block cache*/ 0, /*1M*/ 1 * 1024 * 1024};
+  auto types = {/*compressed*/ 1, /*uncompressed*/ 0};
+  for (auto bsize : bsizes) {
+    for (auto type : types) {
+      BlockBasedTableOptions table_options;
+      table_options.persistent_cache.reset(
+          new MockPersistentCache(type, 10 * 1024));
+      table_options.no_block_cache = true;
+      table_options.block_cache = bsize ? NewLRUCache(bsize) : nullptr;
+      table_options.block_cache_compressed = nullptr;
+      options.table_factory.reset(NewBlockBasedTableFactory(table_options));
+
+      DestroyAndReopen(options);
+      CreateAndReopenWithCF({"pikachu"}, options);
+      // default column family doesn't have block cache
+      Options no_block_cache_opts;
+      no_block_cache_opts.statistics = options.statistics;
+      no_block_cache_opts = CurrentOptions(no_block_cache_opts);
+      BlockBasedTableOptions table_options_no_bc;
+      table_options_no_bc.no_block_cache = true;
+      no_block_cache_opts.table_factory.reset(
+          NewBlockBasedTableFactory(table_options_no_bc));
+      ReopenWithColumnFamilies(
+          {"default", "pikachu"},
+          std::vector<Options>({no_block_cache_opts, options}));
+
+      Random rnd(301);
+
+      // Write 8MB (80 values, each 100K)
+      ASSERT_EQ(NumTableFilesAtLevel(0, 1), 0);
+      std::vector<std::string> values;
+      std::string str;
+      for (int i = 0; i < num_iter; i++) {
+        if (i % 4 == 0) {  // high compression ratio
+          str = RandomString(&rnd, 1000);
+        }
+        values.push_back(str);
+        ASSERT_OK(Put(1, Key(i), values[i]));
+      }
+
+      // flush all data from memtable so that reads are from block cache
+      ASSERT_OK(Flush(1));
+
+      for (int i = 0; i < num_iter; i++) {
+        ASSERT_EQ(Get(1, Key(i)), values[i]);
+      }
+
+      auto hit = options.statistics->getTickerCount(PERSISTENT_CACHE_HIT);
+      auto miss = options.statistics->getTickerCount(PERSISTENT_CACHE_MISS);
+
+      ASSERT_GT(hit, 0);
+      ASSERT_GT(miss, 0);
+    }
+  }
+}
+#endif
 }  // namespace rocksdb
 
 int main(int argc, char** argv) {

@@ -40,6 +40,7 @@
 #include "db/dbformat.h"
 #include "db/flush_scheduler.h"
 #include "db/memtable.h"
+#include "db/merge_context.h"
 #include "db/snapshot_impl.h"
 #include "db/write_batch_internal.h"
 #include "rocksdb/merge_operator.h"
@@ -691,7 +692,6 @@ class MemTableInserter : public WriteBatch::Handler {
   // log number that all Memtables inserted into should reference
   uint64_t log_number_ref_;
   DBImpl* db_;
-  const bool dont_filter_deletes_;
   const bool concurrent_memtable_writes_;
   // current recovered transaction we are rebuilding (recovery)
   WriteBatch* rebuilding_trx_;
@@ -701,7 +701,6 @@ class MemTableInserter : public WriteBatch::Handler {
                    FlushScheduler* flush_scheduler,
                    bool ignore_missing_column_families,
                    uint64_t recovering_log_number, DB* db,
-                   const bool dont_filter_deletes,
                    bool concurrent_memtable_writes)
       : sequence_(sequence),
         cf_mems_(cf_mems),
@@ -710,13 +709,9 @@ class MemTableInserter : public WriteBatch::Handler {
         recovering_log_number_(recovering_log_number),
         log_number_ref_(0),
         db_(reinterpret_cast<DBImpl*>(db)),
-        dont_filter_deletes_(dont_filter_deletes),
         concurrent_memtable_writes_(concurrent_memtable_writes),
         rebuilding_trx_(nullptr) {
     assert(cf_mems_);
-    if (!dont_filter_deletes_) {
-      assert(db_);
-    }
   }
 
   void set_log_number_ref(uint64_t log) { log_number_ref_ = log; }
@@ -826,23 +821,6 @@ class MemTableInserter : public WriteBatch::Handler {
   Status DeleteImpl(uint32_t column_family_id, const Slice& key,
                     ValueType delete_type) {
     MemTable* mem = cf_mems_->GetMemTable();
-    auto* moptions = mem->GetMemTableOptions();
-    if (!dont_filter_deletes_ && moptions->filter_deletes) {
-      assert(!concurrent_memtable_writes_);
-      SnapshotImpl read_from_snapshot;
-      read_from_snapshot.number_ = sequence_;
-      ReadOptions ropts;
-      ropts.snapshot = &read_from_snapshot;
-      std::string value;
-      auto cf_handle = cf_mems_->GetColumnFamilyHandle();
-      if (cf_handle == nullptr) {
-        cf_handle = db_->DefaultColumnFamily();
-      }
-      if (!db_->KeyMayExist(ropts, cf_handle, key, &value)) {
-        RecordTick(moptions->statistics, NUMBER_FILTERED_DELETES);
-        return Status::OK();
-      }
-    }
     mem->Add(sequence_, delete_type, key, Slice(), concurrent_memtable_writes_);
     sequence_++;
     CheckMemtableFull();
@@ -936,20 +914,13 @@ class MemTableInserter : public WriteBatch::Handler {
       std::deque<std::string> operands;
       operands.push_front(value.ToString());
       std::string new_value;
-      bool merge_success = false;
-      {
-        StopWatchNano timer(Env::Default(), moptions->statistics != nullptr);
-        PERF_TIMER_GUARD(merge_operator_time_nanos);
-        merge_success = merge_operator->FullMerge(
-            key, &get_value_slice, operands, &new_value, moptions->info_log);
-        RecordTick(moptions->statistics, MERGE_OPERATION_TOTAL_TIME,
-                   timer.ElapsedNanos());
-      }
 
-      if (!merge_success) {
-          // Failed to merge!
-        RecordTick(moptions->statistics, NUMBER_MERGE_FAILURES);
+      Status merge_status = MergeHelper::TimedFullMerge(
+          merge_operator, key, &get_value_slice, operands, &new_value,
+          moptions->info_log, moptions->statistics, Env::Default());
 
+      if (!merge_status.ok()) {
+        // Failed to merge!
         // Store the delta in memtable
         perform_merge = false;
       } else {
@@ -1041,7 +1012,7 @@ class MemTableInserter : public WriteBatch::Handler {
         // at this point individual CF lognumbers will prevent
         // duplicate re-insertion of values.
         assert(log_number_ref_ == 0);
-        // all insertes must refernce this trx log number
+        // all insertes must reference this trx log number
         log_number_ref_ = trx->log_number_;
         s = trx->batch_->Iterate(this);
         log_number_ref_ = 0;
@@ -1086,10 +1057,10 @@ Status WriteBatchInternal::InsertInto(
     const autovector<WriteThread::Writer*>& writers, SequenceNumber sequence,
     ColumnFamilyMemTables* memtables, FlushScheduler* flush_scheduler,
     bool ignore_missing_column_families, uint64_t log_number, DB* db,
-    const bool dont_filter_deletes, bool concurrent_memtable_writes) {
+    bool concurrent_memtable_writes) {
   MemTableInserter inserter(sequence, memtables, flush_scheduler,
                             ignore_missing_column_families, log_number, db,
-                            dont_filter_deletes, concurrent_memtable_writes);
+                            concurrent_memtable_writes);
   for (size_t i = 0; i < writers.size(); i++) {
     auto w = writers[i];
     if (!w->ShouldWriteToMemtable()) {
@@ -1109,26 +1080,26 @@ Status WriteBatchInternal::InsertInto(WriteThread::Writer* writer,
                                       FlushScheduler* flush_scheduler,
                                       bool ignore_missing_column_families,
                                       uint64_t log_number, DB* db,
-                                      const bool dont_filter_deletes,
                                       bool concurrent_memtable_writes) {
   MemTableInserter inserter(WriteBatchInternal::Sequence(writer->batch),
                             memtables, flush_scheduler,
                             ignore_missing_column_families, log_number, db,
-                            dont_filter_deletes, concurrent_memtable_writes);
+                            concurrent_memtable_writes);
   assert(writer->ShouldWriteToMemtable());
   inserter.set_log_number_ref(writer->log_ref);
   return writer->batch->Iterate(&inserter);
 }
 
-Status WriteBatchInternal::InsertInto(
-    const WriteBatch* batch, ColumnFamilyMemTables* memtables,
-    FlushScheduler* flush_scheduler, bool ignore_missing_column_families,
-    uint64_t log_number, DB* db, const bool dont_filter_deletes,
-    bool concurrent_memtable_writes, SequenceNumber* last_seq_used) {
+Status WriteBatchInternal::InsertInto(const WriteBatch* batch,
+                                      ColumnFamilyMemTables* memtables,
+                                      FlushScheduler* flush_scheduler,
+                                      bool ignore_missing_column_families,
+                                      uint64_t log_number, DB* db,
+                                      bool concurrent_memtable_writes,
+                                      SequenceNumber* last_seq_used) {
   MemTableInserter inserter(WriteBatchInternal::Sequence(batch), memtables,
                             flush_scheduler, ignore_missing_column_families,
-                            log_number, db, dont_filter_deletes,
-                            concurrent_memtable_writes);
+                            log_number, db, concurrent_memtable_writes);
   Status s = batch->Iterate(&inserter);
   if (last_seq_used != nullptr) {
     *last_seq_used = inserter.get_final_sequence();

@@ -16,13 +16,16 @@
 #include "db/filename.h"
 #include "port/port.h"
 #include "port/stack_trace.h"
+#include "rocksdb/rate_limiter.h"
 #include "rocksdb/transaction_log.h"
 #include "rocksdb/types.h"
 #include "rocksdb/utilities/backupable_db.h"
+#include "rocksdb/utilities/options_util.h"
 #include "util/env_chroot.h"
 #include "util/file_reader_writer.h"
 #include "util/mutexlock.h"
 #include "util/random.h"
+#include "util/stderr_logger.h"
 #include "util/string_util.h"
 #include "util/sync_point.h"
 #include "util/testharness.h"
@@ -197,8 +200,9 @@ class TestEnv : public EnvWrapper {
 
   void AssertWrittenFiles(std::vector<std::string>& should_have_written) {
     MutexLock l(&mutex_);
-    sort(should_have_written.begin(), should_have_written.end());
-    sort(written_files_.begin(), written_files_.end());
+    std::sort(should_have_written.begin(), should_have_written.end());
+    std::sort(written_files_.begin(), written_files_.end());
+
     ASSERT_TRUE(written_files_ == should_have_written);
   }
 
@@ -755,8 +759,8 @@ TEST_F(BackupableDBTest, NoDoubleCopy) {
   test_backup_env_->SetLimitWrittenFiles(7);
   test_backup_env_->ClearWrittenFiles();
   test_db_env_->SetLimitWrittenFiles(0);
-  dummy_db_->live_files_ = { "/00010.sst", "/00011.sst",
-                             "/CURRENT",   "/MANIFEST-01" };
+  dummy_db_->live_files_ = {"/00010.sst", "/00011.sst", "/CURRENT",
+                            "/MANIFEST-01"};
   dummy_db_->wal_files_ = {{"/00011.log", true}, {"/00012.log", false}};
   test_db_env_->SetFilenamesForMockedAttrs(dummy_db_->live_files_);
   ASSERT_OK(backup_engine_->CreateNewBackup(db_.get(), false));
@@ -772,20 +776,20 @@ TEST_F(BackupableDBTest, NoDoubleCopy) {
   // should not write/copy 00010.sst, since it's already there!
   test_backup_env_->SetLimitWrittenFiles(6);
   test_backup_env_->ClearWrittenFiles();
-  dummy_db_->live_files_ = { "/00010.sst", "/00015.sst",
-                             "/CURRENT",   "/MANIFEST-01" };
+
+  dummy_db_->live_files_ = {"/00010.sst", "/00015.sst", "/CURRENT",
+                            "/MANIFEST-01"};
   dummy_db_->wal_files_ = {{"/00011.log", true}, {"/00012.log", false}};
   test_db_env_->SetFilenamesForMockedAttrs(dummy_db_->live_files_);
   ASSERT_OK(backup_engine_->CreateNewBackup(db_.get(), false));
   // should not open 00010.sst - it's already there
-  should_have_written = {
-    "/shared/00015.sst.tmp",
-    "/private/2.tmp/CURRENT",
-    "/private/2.tmp/MANIFEST-01",
-    "/private/2.tmp/00011.log",
-    "/meta/2.tmp",
-    "/LATEST_BACKUP.tmp"
-  };
+
+  should_have_written = {"/shared/00015.sst.tmp",
+                         "/private/2.tmp/CURRENT",
+                         "/private/2.tmp/MANIFEST-01",
+                         "/private/2.tmp/00011.log",
+                         "/meta/2.tmp",
+                         "/LATEST_BACKUP.tmp"};
   AppendPath(backupdir_, should_have_written);
   test_backup_env_->AssertWrittenFiles(should_have_written);
 
@@ -940,6 +944,39 @@ TEST_F(BackupableDBTest, CorruptionsTest) {
   ASSERT_OK(backup_engine_->CreateNewBackup(db_.get(), !!(rnd.Next() % 2)));
   CloseDBAndBackupEngine();
   AssertBackupConsistency(2, 0, keys_iteration * 2, keys_iteration * 5);
+}
+
+inline std::string OptionsPath(std::string ret, int backupID) {
+  ret += "/private/";
+  ret += std::to_string(backupID);
+  ret += "/";
+  return ret;
+}
+
+// Backup the LATEST options file to
+// "<backup_dir>/private/<backup_id>/OPTIONS<number>"
+
+TEST_F(BackupableDBTest, BackupOptions) {
+  OpenDBAndBackupEngine(true);
+  for (int i = 1; i < 5; i++) {
+    std::string name;
+    std::vector<std::string> filenames;
+    // Must reset() before reset(OpenDB()) again.
+    // Calling OpenDB() while *db_ is existing will cause LOCK issue
+    db_.reset();
+    db_.reset(OpenDB());
+    ASSERT_OK(backup_engine_->CreateNewBackup(db_.get(), true));
+    rocksdb::GetLatestOptionsFileName(db_->GetName(), options_.env, &name);
+    ASSERT_OK(file_manager_->FileExists(OptionsPath(backupdir_, i) + name));
+    backup_chroot_env_->GetChildren(OptionsPath(backupdir_, i), &filenames);
+    for (auto fn : filenames) {
+      if (fn.compare(0, 7, "OPTIONS") == 0) {
+        ASSERT_EQ(name, fn);
+      }
+    }
+  }
+
+  CloseDBAndBackupEngine();
 }
 
 // This test verifies we don't delete the latest backup when read-only option is
@@ -1117,45 +1154,58 @@ TEST_F(BackupableDBTest, KeepLogFiles) {
 }
 
 TEST_F(BackupableDBTest, RateLimiting) {
-  // iter 0 -- single threaded
-  // iter 1 -- multi threaded
-  for (int iter = 0; iter < 2; ++iter) {
-    uint64_t const KB = 1024 * 1024;
-    size_t const kMicrosPerSec = 1000 * 1000LL;
+  size_t const kMicrosPerSec = 1000 * 1000LL;
+  uint64_t const MB = 1024 * 1024;
 
-    std::vector<std::pair<uint64_t, uint64_t>> limits(
-        {{KB, 5 * KB}, {2 * KB, 3 * KB}});
+  const std::vector<std::pair<uint64_t, uint64_t>> limits(
+      {{1 * MB, 5 * MB}, {2 * MB, 3 * MB}});
 
-    for (const auto& limit : limits) {
-      // destroy old data
-      DestroyDB(dbname_, options_);
+  std::shared_ptr<RateLimiter> backupThrottler(NewGenericRateLimiter(1));
+  std::shared_ptr<RateLimiter> restoreThrottler(NewGenericRateLimiter(1));
 
-      backupable_options_->backup_rate_limit = limit.first;
-      backupable_options_->restore_rate_limit = limit.second;
-      backupable_options_->max_background_operations = (iter == 0) ? 1 : 10;
-      options_.compression = kNoCompression;
-      OpenDBAndBackupEngine(true);
-      size_t bytes_written = FillDB(db_.get(), 0, 100000);
+  for (bool makeThrottler : {false, true}) {
+    if (makeThrottler) {
+      backupable_options_->backup_rate_limiter = backupThrottler;
+      backupable_options_->restore_rate_limiter = restoreThrottler;
+    }
+    // iter 0 -- single threaded
+    // iter 1 -- multi threaded
+    for (int iter = 0; iter < 2; ++iter) {
+      for (const auto& limit : limits) {
+        // destroy old data
+        DestroyDB(dbname_, Options());
+        if (makeThrottler) {
+          backupThrottler->SetBytesPerSecond(limit.first);
+          restoreThrottler->SetBytesPerSecond(limit.second);
+        } else {
+          backupable_options_->backup_rate_limit = limit.first;
+          backupable_options_->restore_rate_limit = limit.second;
+        }
+        backupable_options_->max_background_operations = (iter == 0) ? 1 : 10;
+        options_.compression = kNoCompression;
+        OpenDBAndBackupEngine(true);
+        size_t bytes_written = FillDB(db_.get(), 0, 100000);
 
-      auto start_backup = db_chroot_env_->NowMicros();
-      ASSERT_OK(backup_engine_->CreateNewBackup(db_.get(), false));
-      auto backup_time = db_chroot_env_->NowMicros() - start_backup;
-      auto rate_limited_backup_time = (bytes_written * kMicrosPerSec) /
-                                      backupable_options_->backup_rate_limit;
-      ASSERT_GT(backup_time, 0.8 * rate_limited_backup_time);
+        auto start_backup = db_chroot_env_->NowMicros();
+        ASSERT_OK(backup_engine_->CreateNewBackup(db_.get(), false));
+        auto backup_time = db_chroot_env_->NowMicros() - start_backup;
+        auto rate_limited_backup_time =
+            (bytes_written * kMicrosPerSec) / limit.first;
+        ASSERT_GT(backup_time, 0.8 * rate_limited_backup_time);
 
-      CloseDBAndBackupEngine();
+        CloseDBAndBackupEngine();
 
-      OpenBackupEngine();
-      auto start_restore = db_chroot_env_->NowMicros();
-      ASSERT_OK(backup_engine_->RestoreDBFromLatestBackup(dbname_, dbname_));
-      auto restore_time = db_chroot_env_->NowMicros() - start_restore;
-      CloseBackupEngine();
-      auto rate_limited_restore_time = (bytes_written * kMicrosPerSec) /
-                                       backupable_options_->restore_rate_limit;
-      ASSERT_GT(restore_time, 0.8 * rate_limited_restore_time);
+        OpenBackupEngine();
+        auto start_restore = db_chroot_env_->NowMicros();
+        ASSERT_OK(backup_engine_->RestoreDBFromLatestBackup(dbname_, dbname_));
+        auto restore_time = db_chroot_env_->NowMicros() - start_restore;
+        CloseBackupEngine();
+        auto rate_limited_restore_time =
+            (bytes_written * kMicrosPerSec) / limit.second;
+        ASSERT_GT(restore_time, 0.8 * rate_limited_restore_time);
 
-      AssertBackupConsistency(0, 0, 100000, 100010);
+        AssertBackupConsistency(0, 0, 100000, 100010);
+      }
     }
   }
 }

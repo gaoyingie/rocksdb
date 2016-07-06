@@ -31,13 +31,13 @@
 #include "db/wal_manager.h"
 #include "db/write_controller.h"
 #include "db/write_thread.h"
-#include "db/writebuffer.h"
 #include "memtable_list.h"
 #include "port/port.h"
 #include "rocksdb/db.h"
 #include "rocksdb/env.h"
 #include "rocksdb/memtablerep.h"
 #include "rocksdb/transaction_log.h"
+#include "rocksdb/write_buffer_manager.h"
 #include "table/scoped_arena_iterator.h"
 #include "util/autovector.h"
 #include "util/event_logger.h"
@@ -57,6 +57,7 @@ class Arena;
 class WriteCallback;
 struct JobContext;
 struct ExternalSstFileInfo;
+struct MemTableInfo;
 
 class DBImpl : public DB {
  public:
@@ -344,6 +345,10 @@ class DBImpl : public DB {
   Status TEST_GetAllImmutableCFOptions(
       std::unordered_map<std::string, const ImmutableCFOptions*>* iopts_map);
 
+  // Return the lastest MutableCFOptions of of a column family
+  Status TEST_GetLatestMutableCFOptions(ColumnFamilyHandle* column_family,
+                                        MutableCFOptions* mutable_cf_opitons);
+
   Cache* TEST_table_cache() { return table_cache_.get(); }
 
   WriteController& TEST_write_controler() { return write_controller_; }
@@ -353,7 +358,7 @@ class DBImpl : public DB {
 
 #endif  // NDEBUG
 
-  // Return maximum background compaction alowed to be scheduled based on
+  // Return maximum background compaction allowed to be scheduled based on
   // compaction status.
   int BGCompactionsAllowed() const;
 
@@ -369,7 +374,10 @@ class DBImpl : public DB {
   // belong to live files are posibly removed. Also, removes all the
   // files in sst_delete_files and log_delete_files.
   // It is not necessary to hold the mutex when invoking this method.
-  void PurgeObsoleteFiles(const JobContext& background_contet);
+  void PurgeObsoleteFiles(const JobContext& background_contet,
+                          bool schedule_only = false);
+
+  void SchedulePurge();
 
   ColumnFamilyHandle* DefaultColumnFamily() const override;
 
@@ -472,8 +480,18 @@ class DBImpl : public DB {
     delete trx;
   }
 
+  void DeleteAllRecoveredTransactions() {
+    for (auto it = recovered_transactions_.begin();
+         it != recovered_transactions_.end(); it++) {
+      delete it->second;
+    }
+    recovered_transactions_.clear();
+  }
+
   void MarkLogAsHavingPrepSectionFlushed(uint64_t log);
   void MarkLogAsContainingPrepSection(uint64_t log);
+
+  Status NewDB();
 
  protected:
   Env* const env_;
@@ -508,6 +526,8 @@ class DBImpl : public DB {
                                    Compaction *c, const Status &st,
                                    const CompactionJobStats& job_stats,
                                    int job_id);
+  void NotifyOnMemTableSealed(ColumnFamilyData* cfd,
+                              const MemTableInfo& mem_table_info);
 
   void NewThreadStatusCfInfo(ColumnFamilyData* cfd) const;
 
@@ -539,7 +559,7 @@ class DBImpl : public DB {
 
   struct WriteContext;
 
-  Status NewDB();
+  struct PurgeFileInfo;
 
   // Recover the descriptor from persistent storage.  May do a significant
   // amount of work to recover recently logged updates.  Any changes to
@@ -554,6 +574,10 @@ class DBImpl : public DB {
 
   // Delete any unneeded files and stale in-memory entries.
   void DeleteObsoleteFiles();
+  // Delete obsolete files and log status and information of file deletion
+  void DeleteObsoleteFileImpl(Status file_deletion_status, int job_id,
+                              const std::string& fname, FileType type,
+                              uint64_t number, uint32_t path_id);
 
   // Background process needs to call
   //     auto x = CaptureCurrentFileNumberInPendingOutputs()
@@ -608,6 +632,11 @@ class DBImpl : public DB {
   Status WaitForFlushMemTable(ColumnFamilyData* cfd);
 
 #ifndef ROCKSDB_LITE
+  // Finds the lowest level in the DB that the ingested file can be added to
+  // REQUIRES: mutex_ held
+  int PickLevelForIngestedFile(ColumnFamilyData* cfd,
+                               const ExternalSstFileInfo* file_info);
+
   Status CompactFilesImpl(
       const CompactionOptions& compact_options, ColumnFamilyData* cfd,
       Version* version, const std::vector<std::string>& input_file_names,
@@ -620,11 +649,15 @@ class DBImpl : public DB {
   void MaybeScheduleFlushOrCompaction();
   void SchedulePendingFlush(ColumnFamilyData* cfd);
   void SchedulePendingCompaction(ColumnFamilyData* cfd);
+  void SchedulePendingPurge(std::string fname, FileType type, uint64_t number,
+                            uint32_t path_id, int job_id);
   static void BGWorkCompaction(void* arg);
   static void BGWorkFlush(void* db);
+  static void BGWorkPurge(void* arg);
   static void UnscheduleCallback(void* arg);
   void BackgroundCallCompaction(void* arg);
   void BackgroundCallFlush();
+  void BackgroundCallPurge();
   Status BackgroundCompaction(bool* madeProgress, JobContext* job_context,
                               LogBuffer* log_buffer, void* m = 0);
   Status BackgroundFlush(bool* madeProgress, JobContext* job_context,
@@ -675,9 +708,9 @@ class DBImpl : public DB {
   // * if AnyManualCompaction, whenever a compaction finishes, even if it hasn't
   // made any progress
   // * whenever a compaction made any progress
-  // * whenever bg_flush_scheduled_ value decreases (i.e. whenever a flush is
-  // done, even if it didn't make any progress)
-  // * whenever there is an error in background flush or compaction
+  // * whenever bg_flush_scheduled_ or bg_purge_scheduled_ value decreases
+  // (i.e. whenever a flush is done, even if it didn't make any progress)
+  // * whenever there is an error in background purge, flush or compaction
   InstrumentedCondVar bg_cv_;
   uint64_t logfile_number_;
   std::deque<uint64_t>
@@ -770,7 +803,7 @@ class DBImpl : public DB {
 
   Directories directories_;
 
-  WriteBuffer write_buffer_;
+  WriteBufferManager* write_buffer_manager_;
 
   WriteThread write_thread_;
 
@@ -797,6 +830,19 @@ class DBImpl : public DB {
   // State is protected with db mutex.
   std::list<uint64_t> pending_outputs_;
 
+  // PurgeFileInfo is a structure to hold information of files to be deleted in
+  // purge_queue_
+  struct PurgeFileInfo {
+    std::string fname;
+    FileType type;
+    uint64_t number;
+    uint32_t path_id;
+    int job_id;
+    PurgeFileInfo(std::string fn, FileType t, uint64_t num, uint32_t pid,
+                  int jid)
+        : fname(fn), type(t), number(num), path_id(pid), job_id(jid) {}
+  };
+
   // flush_queue_ and compaction_queue_ hold column families that we need to
   // flush and compact, respectively.
   // A column family is inserted into flush_queue_ when it satisfies condition
@@ -821,6 +867,9 @@ class DBImpl : public DB {
   // invariant(column family present in compaction_queue_ <==>
   // ColumnFamilyData::pending_compaction_ == true)
   std::deque<ColumnFamilyData*> compaction_queue_;
+
+  // A queue to store filenames of the files to be purged
+  std::deque<PurgeFileInfo> purge_queue_;
   int unscheduled_flushes_;
   int unscheduled_compactions_;
 
@@ -835,6 +884,9 @@ class DBImpl : public DB {
 
   // stores the number of flushes are currently running
   int num_running_flushes_;
+
+  // number of background obsolete file purge jobs, submitted to the HIGH pool
+  int bg_purge_scheduled_;
 
   // Information for a manual compaction
   struct ManualCompaction {
@@ -896,6 +948,10 @@ class DBImpl : public DB {
 
   // The options to access storage files
   const EnvOptions env_options_;
+
+  // A set of compactions that are running right now
+  // REQUIRES: mutex held
+  std::unordered_set<Compaction*> running_compactions_;
 
 #ifndef ROCKSDB_LITE
   WalManager wal_manager_;

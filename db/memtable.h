@@ -32,7 +32,6 @@ namespace rocksdb {
 class Mutex;
 class MemTableIterator;
 class MergeContext;
-class WriteBuffer;
 class InternalIterator;
 
 struct MemTableOptions {
@@ -42,7 +41,6 @@ struct MemTableOptions {
   size_t write_buffer_size;
   size_t arena_block_size;
   uint32_t memtable_prefix_bloom_bits;
-  uint32_t memtable_prefix_bloom_probes;
   size_t memtable_prefix_bloom_huge_page_tlb_size;
   bool inplace_update_support;
   size_t inplace_update_num_locks;
@@ -51,7 +49,6 @@ struct MemTableOptions {
                                    Slice delta_value,
                                    std::string* merged_value);
   size_t max_successive_merges;
-  bool filter_deletes;
   Statistics* statistics;
   MergeOperator* merge_operator;
   Logger* info_log;
@@ -93,7 +90,8 @@ class MemTable {
   explicit MemTable(const InternalKeyComparator& comparator,
                     const ImmutableCFOptions& ioptions,
                     const MutableCFOptions& mutable_cf_options,
-                    WriteBuffer* write_buffer, SequenceNumber earliest_seq);
+                    WriteBufferManager* write_buffer_manager,
+                    SequenceNumber earliest_seq);
 
   // Do not delete this MemTable unless Unref() indicates it not in use.
   ~MemTable();
