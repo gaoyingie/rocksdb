@@ -12,12 +12,12 @@
 #include "db/db_impl.h"
 #include "db/dbformat.h"
 #include "db/table_properties_collector.h"
-#include "rocksdb/immutable_options.h"
 #include "rocksdb/table.h"
 #include "table/block_based_table_factory.h"
 #include "table/meta_blocks.h"
 #include "table/plain_table_factory.h"
 #include "table/table_builder.h"
+#include "util/cf_options.h"
 #include "util/coding.h"
 #include "util/file_reader_writer.h"
 #include "util/testharness.h"
@@ -46,11 +46,12 @@ void MakeBuilder(const Options& options, const ImmutableCFOptions& ioptions,
                  std::unique_ptr<TableBuilder>* builder) {
   unique_ptr<WritableFile> wf(new test::StringSink);
   writable->reset(new WritableFileWriter(std::move(wf), EnvOptions()));
-
+  int unknown_level = -1;
   builder->reset(NewTableBuilder(
       ioptions, internal_comparator, int_tbl_prop_collector_factories,
       kTestColumnFamilyId, kTestColumnFamilyName,
-      writable->get(), options.compression, options.compression_opts));
+      writable->get(), options.compression, options.compression_opts,
+      unknown_level));
 }
 }  // namespace
 
@@ -276,7 +277,7 @@ void TestCustomizedTablePropertiesCollector(
           new test::StringSource(fwf->contents())));
   TableProperties* props;
   Status s = ReadTableProperties(fake_file_reader.get(), fwf->contents().size(),
-                                 magic_number, Env::Default(), nullptr, &props);
+                                 magic_number, ioptions, &props);
   std::unique_ptr<TableProperties> props_guard(props);
   ASSERT_OK(s);
 
@@ -417,7 +418,7 @@ void TestInternalKeyPropertiesCollector(
     TableProperties* props;
     Status s =
         ReadTableProperties(reader.get(), fwf->contents().size(), magic_number,
-                            Env::Default(), nullptr, &props);
+                            ioptions, &props);
     ASSERT_OK(s);
 
     std::unique_ptr<TableProperties> props_guard(props);

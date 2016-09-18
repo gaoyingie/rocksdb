@@ -32,8 +32,8 @@ project(rocksdb)
 include(${CMAKE_CURRENT_SOURCE_DIR}/thirdparty.inc)
 execute_process(COMMAND powershell -Command "Get-Date -format MM_dd_yyyy" OUTPUT_VARIABLE DATE)
 execute_process(COMMAND powershell -Command "Get-Date -format HH:mm:ss" OUTPUT_VARIABLE TIME)
-string(REGEX REPLACE "(..)_(..)_..(..).*" "\\1/\\2/\\3" DATE ${DATE})
-string(REGEX REPLACE "(..):(.....).*" " \\1:\\2" TIME ${TIME})
+string(REGEX REPLACE "(..)_(..)_..(..).*" "\\1/\\2/\\3" DATE "${DATE}")
+string(REGEX REPLACE "(..):(.....).*" " \\1:\\2" TIME "${TIME}")
 string(CONCAT GIT_DATE_TIME ${DATE} ${TIME})
 
 find_package(Git)
@@ -44,7 +44,7 @@ else()
     set(GIT_SHA 0)
 endif()
 
-string(REGEX REPLACE "[^0-9a-f]+" "" GIT_SHA ${GIT_SHA})
+string(REGEX REPLACE "[^0-9a-f]+" "" GIT_SHA "${GIT_SHA}")
 
 set(BUILD_VERSION_CC ${CMAKE_CURRENT_SOURCE_DIR}/util/build_version.cc)
 
@@ -193,7 +193,8 @@ set(SOURCES
         util/arena.cc
         util/bloom.cc
         util/build_version.cc
-        util/cache.cc
+        util/cf_options.cc
+        util/clock_cache.cc
         util/coding.cc
         util/compaction_job_stats_impl.cc
         util/comparator.cc
@@ -214,13 +215,13 @@ set(SOURCES
         util/histogram_windowing.cc
         util/instrumented_mutex.cc
         util/iostats_context.cc
+        util/lru_cache.cc
         tools/ldb_cmd.cc
         tools/ldb_tool.cc
         util/logging.cc
         util/log_buffer.cc
         util/memenv.cc
         util/murmurhash.cc
-        util/mutable_cf_options.cc
         util/options.cc
         util/options_helper.cc
         util/options_parser.cc
@@ -229,6 +230,7 @@ set(SOURCES
         util/perf_level.cc
         util/random.cc
         util/rate_limiter.cc
+        util/sharded_cache.cc
         util/slice.cc
         util/statistics.cc
         util/status.cc
@@ -238,7 +240,7 @@ set(SOURCES
         util/testharness.cc
         util/testutil.cc
         util/thread_local.cc
-        util/threadpool.cc
+        util/threadpool_imp.cc
         util/thread_status_impl.cc
         util/thread_status_updater.cc
         util/thread_status_util.cc
@@ -247,8 +249,10 @@ set(SOURCES
         util/xfunc.cc
         util/xxhash.cc
         utilities/backupable/backupable_db.cc
+        utilities/blob_db/blob_db.cc
         utilities/checkpoint/checkpoint.cc
         utilities/compaction_filters/remove_emptyvalue_compactionfilter.cc
+        utilities/date_tiered/date_tiered_db_impl.cc
         utilities/document/document_db.cc
         utilities/document/json_document.cc
         utilities/document/json_document_builder.cc
@@ -263,7 +267,11 @@ set(SOURCES
         utilities/merge_operators/put.cc
         utilities/merge_operators/max.cc
         utilities/merge_operators/uint64add.cc
+        utilities/option_change_migration/option_change_migration.cc
         utilities/options/options_util.cc
+        utilities/persistent_cache/block_cache_tier.cc
+        utilities/persistent_cache/block_cache_tier_file.cc
+        utilities/persistent_cache/block_cache_tier_metadata.cc
         utilities/persistent_cache/persistent_cache_tier.cc
         utilities/persistent_cache/volatile_tier_impl.cc
         utilities/redis/redis_lists.cc
@@ -281,6 +289,9 @@ set(SOURCES
         utilities/ttl/db_ttl_impl.cc
         utilities/write_batch_with_index/write_batch_with_index.cc
         utilities/write_batch_with_index/write_batch_with_index_internal.cc
+        utilities/col_buf_encoder.cc
+        utilities/col_buf_decoder.cc
+        utilities/column_aware_encoding_util.cc
 )
 
 # For test util library that is build only in DEBUG mode
@@ -326,6 +337,7 @@ set(APPS
         tools/dump/rocksdb_undump.cc
         util/cache_bench.cc
         utilities/persistent_cache/hash_table_bench.cc
+        utilities/column_aware_encoding_exp.cc
 )
 
 set(C_TESTS db/c_test.c)
@@ -347,6 +359,7 @@ set(TESTS
         db/db_inplace_update_test.cc
         db/db_iter_test.cc
         db/db_log_iter_test.cc
+        db/db_options_test.cc
         db/db_properties_test.cc
         db/db_table_properties_test.cc
         db/db_tailing_iter_test.cc
@@ -354,8 +367,10 @@ set(TESTS
         db/db_test2.cc
         db/db_block_cache_test.cc
         db/db_bloom_filter_test.cc
+        db/db_flush_test.cc
         db/db_iterator_test.cc
         db/db_sst_test.cc
+        db/external_sst_file_test.cc
         db/db_universal_compaction_test.cc
         db/db_wal_test.cc
         db/dbformat_test.cc
@@ -413,21 +428,26 @@ set(TESTS
         util/heap_test.cc
         util/histogram_test.cc
         util/iostats_context_test.cc
+        util/lru_cache_test.cc
         util/mock_env_test.cc
         util/options_settable_test.cc
         util/options_test.cc
         util/rate_limiter_test.cc
         util/slice_transform_test.cc
+        util/statistics_test.cc
         util/thread_list_test.cc
         util/thread_local_test.cc
         utilities/backupable/backupable_db_test.cc
+        utilities/blob_db/blob_db_test.cc
         utilities/checkpoint/checkpoint_test.cc
+        utilities/date_tiered/date_tiered_test.cc
         utilities/document/document_db_test.cc
         utilities/document/json_document_test.cc
         utilities/env_registry_test.cc
         utilities/geodb/geodb_test.cc
         utilities/memory/memory_test.cc
         utilities/merge_operators/string_append/stringappend_test.cc
+        utilities/option_change_migration/option_change_migration_test.cc
         utilities/options/options_util_test.cc
         utilities/persistent_cache/hash_table_test.cc
         utilities/persistent_cache/persistent_cache_test.cc
@@ -438,6 +458,7 @@ set(TESTS
         utilities/transactions/transaction_test.cc
         utilities/ttl/ttl_test.cc
         utilities/write_batch_with_index/write_batch_with_index_test.cc
+        utilities/column_aware_encoding_test.cc
 )
 
 set(EXES ${APPS})

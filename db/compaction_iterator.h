@@ -13,6 +13,7 @@
 
 #include "db/compaction.h"
 #include "db/merge_helper.h"
+#include "db/pinned_iterators_manager.h"
 #include "rocksdb/compaction_filter.h"
 #include "util/log_buffer.h"
 
@@ -33,6 +34,10 @@ struct CompactionIteratorStats {
   uint64_t num_input_corrupt_records = 0;
   uint64_t total_input_raw_key_bytes = 0;
   uint64_t total_input_raw_value_bytes = 0;
+
+  // Single-Delete diagnostics for exceptional situations
+  uint64_t num_single_del_fallthru = 0;
+  uint64_t num_single_del_mismatch = 0;
 };
 
 class CompactionIterator {
@@ -45,6 +50,8 @@ class CompactionIterator {
                      const Compaction* compaction = nullptr,
                      const CompactionFilter* compaction_filter = nullptr,
                      LogBuffer* log_buffer = nullptr);
+
+  ~CompactionIterator();
 
   void ResetRecordCounts();
 
@@ -136,6 +143,9 @@ class CompactionIterator {
   bool clear_and_output_next_key_ = false;
 
   MergeOutputIterator merge_out_iter_;
+  // PinnedIteratorsManager used to pin input_ Iterator blocks while reading
+  // merge operands and then releasing them after consuming them.
+  PinnedIteratorsManager pinned_iters_mgr_;
   std::string compaction_filter_value_;
   // "level_ptrs" holds indices that remember which file of an associated
   // level we were last checking during the last call to compaction->

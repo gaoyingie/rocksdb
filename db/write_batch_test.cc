@@ -31,9 +31,8 @@ static std::string PrintContents(WriteBatch* b) {
   options.memtable_factory = factory;
   ImmutableCFOptions ioptions(options);
   WriteBufferManager wb(options.db_write_buffer_size);
-  MemTable* mem =
-      new MemTable(cmp, ioptions, MutableCFOptions(options, ioptions), &wb,
-                   kMaxSequenceNumber);
+  MemTable* mem = new MemTable(cmp, ioptions, MutableCFOptions(options), &wb,
+                               kMaxSequenceNumber);
   mem->Ref();
   std::string state;
   ColumnFamilyMemTablesDefault cf_mems_default(mem);
@@ -42,6 +41,7 @@ static std::string PrintContents(WriteBatch* b) {
   int put_count = 0;
   int delete_count = 0;
   int single_delete_count = 0;
+  int delete_range_count = 0;
   int merge_count = 0;
   Arena arena;
   ScopedArenaIterator iter(mem->NewIterator(ReadOptions(), &arena));
@@ -73,6 +73,15 @@ static std::string PrintContents(WriteBatch* b) {
         count++;
         single_delete_count++;
         break;
+      case kTypeRangeDeletion:
+        state.append("DeleteRange(");
+        state.append(ikey.user_key.ToString());
+        state.append(", ");
+        state.append(iter->value().ToString());
+        state.append(")");
+        count++;
+        delete_range_count++;
+        break;
       case kTypeMerge:
         state.append("Merge(");
         state.append(ikey.user_key.ToString());
@@ -92,6 +101,7 @@ static std::string PrintContents(WriteBatch* b) {
   EXPECT_EQ(b->HasPut(), put_count > 0);
   EXPECT_EQ(b->HasDelete(), delete_count > 0);
   EXPECT_EQ(b->HasSingleDelete(), single_delete_count > 0);
+  EXPECT_EQ(b->HasDeleteRange(), delete_range_count > 0);
   EXPECT_EQ(b->HasMerge(), merge_count > 0);
   if (!s.ok()) {
     state.append(s.ToString());
@@ -115,15 +125,18 @@ TEST_F(WriteBatchTest, Multiple) {
   WriteBatch batch;
   batch.Put(Slice("foo"), Slice("bar"));
   batch.Delete(Slice("box"));
+  batch.DeleteRange(Slice("bar"), Slice("foo"));
   batch.Put(Slice("baz"), Slice("boo"));
   WriteBatchInternal::SetSequence(&batch, 100);
   ASSERT_EQ(100U, WriteBatchInternal::Sequence(&batch));
-  ASSERT_EQ(3, WriteBatchInternal::Count(&batch));
-  ASSERT_EQ("Put(baz, boo)@102"
-            "Delete(box)@101"
-            "Put(foo, bar)@100",
-            PrintContents(&batch));
-  ASSERT_EQ(3, batch.Count());
+  ASSERT_EQ(4, WriteBatchInternal::Count(&batch));
+  ASSERT_EQ(
+      "DeleteRange(bar, foo)@102"
+      "Put(baz, boo)@103"
+      "Delete(box)@101"
+      "Put(foo, bar)@100",
+      PrintContents(&batch));
+  ASSERT_EQ(4, batch.Count());
 }
 
 TEST_F(WriteBatchTest, Corruption) {
@@ -215,6 +228,18 @@ namespace {
       } else {
         seen += "SingleDeleteCF(" + ToString(column_family_id) + ", " +
                 key.ToString() + ")";
+      }
+      return Status::OK();
+    }
+    virtual Status DeleteRangeCF(uint32_t column_family_id,
+                                 const Slice& begin_key,
+                                 const Slice& end_key) override {
+      if (column_family_id == 0) {
+        seen += "DeleteRange(" + begin_key.ToString() + ", " +
+                end_key.ToString() + ")";
+      } else {
+        seen += "DeleteRangeCF(" + ToString(column_family_id) + ", " +
+                begin_key.ToString() + ", " + end_key.ToString() + ")";
       }
       return Status::OK();
     }
@@ -546,7 +571,7 @@ class ColumnFamilyHandleImplDummy : public ColumnFamilyHandleImpl {
   explicit ColumnFamilyHandleImplDummy(int id)
       : ColumnFamilyHandleImpl(nullptr, nullptr, nullptr), id_(id) {}
   uint32_t GetID() const override { return id_; }
-  const Comparator* user_comparator() const override {
+  const Comparator* GetComparator() const override {
     return BytewiseComparator();
   }
 
@@ -563,6 +588,7 @@ TEST_F(WriteBatchTest, ColumnFamiliesBatchTest) {
   batch.Put(&eight, Slice("eightfoo"), Slice("bar8"));
   batch.Delete(&eight, Slice("eightfoo"));
   batch.SingleDelete(&two, Slice("twofoo"));
+  batch.DeleteRange(&two, Slice("3foo"), Slice("4foo"));
   batch.Merge(&three, Slice("threethree"), Slice("3three"));
   batch.Put(&zero, Slice("foo"), Slice("bar"));
   batch.Merge(Slice("omom"), Slice("nom"));
@@ -575,6 +601,7 @@ TEST_F(WriteBatchTest, ColumnFamiliesBatchTest) {
       "PutCF(8, eightfoo, bar8)"
       "DeleteCF(8, eightfoo)"
       "SingleDeleteCF(2, twofoo)"
+      "DeleteRangeCF(2, 3foo, 4foo)"
       "MergeCF(3, threethree, 3three)"
       "Put(foo, bar)"
       "Merge(omom, nom)",
@@ -590,6 +617,7 @@ TEST_F(WriteBatchTest, ColumnFamiliesBatchWithIndexTest) {
   batch.Put(&eight, Slice("eightfoo"), Slice("bar8"));
   batch.Delete(&eight, Slice("eightfoo"));
   batch.SingleDelete(&two, Slice("twofoo"));
+  batch.DeleteRange(&two, Slice("twofoo"), Slice("threefoo"));
   batch.Merge(&three, Slice("threethree"), Slice("3three"));
   batch.Put(&zero, Slice("foo"), Slice("bar"));
   batch.Merge(Slice("omom"), Slice("nom"));
@@ -627,6 +655,13 @@ TEST_F(WriteBatchTest, ColumnFamiliesBatchWithIndexTest) {
   ASSERT_TRUE(iter->Valid());
   ASSERT_EQ(WriteType::kSingleDeleteRecord, iter->Entry().type);
   ASSERT_EQ("twofoo", iter->Entry().key.ToString());
+
+  iter->Next();
+  ASSERT_OK(iter->status());
+  ASSERT_TRUE(iter->Valid());
+  ASSERT_EQ(WriteType::kDeleteRangeRecord, iter->Entry().type);
+  ASSERT_EQ("twofoo", iter->Entry().key.ToString());
+  ASSERT_EQ("threefoo", iter->Entry().value.ToString());
 
   iter->Next();
   ASSERT_OK(iter->status());
@@ -678,6 +713,7 @@ TEST_F(WriteBatchTest, ColumnFamiliesBatchWithIndexTest) {
       "PutCF(8, eightfoo, bar8)"
       "DeleteCF(8, eightfoo)"
       "SingleDeleteCF(2, twofoo)"
+      "DeleteRangeCF(2, twofoo, threefoo)"
       "MergeCF(3, threethree, 3three)"
       "Put(foo, bar)"
       "Merge(omom, nom)",

@@ -241,10 +241,10 @@ class HashIndexBuilder : public IndexBuilder {
   void FlushPendingPrefix() {
     prefix_block_.append(pending_entry_prefix_.data(),
                          pending_entry_prefix_.size());
-    PutVarint32(&prefix_meta_block_,
-                static_cast<uint32_t>(pending_entry_prefix_.size()));
-    PutVarint32(&prefix_meta_block_, pending_entry_index_);
-    PutVarint32(&prefix_meta_block_, pending_block_num_);
+    PutVarint32Varint32Varint32(
+        &prefix_meta_block_,
+        static_cast<uint32_t>(pending_entry_prefix_.size()),
+        pending_entry_index_, pending_block_num_);
   }
 
   ShortenedIndexBuilder primary_index_builder_;
@@ -312,6 +312,8 @@ bool GoodCompressionRatio(size_t compressed_size, size_t raw_size) {
   return compressed_size < raw_size - (raw_size / 8u);
 }
 
+}  // namespace
+
 // format_version is the block format as defined in include/rocksdb/table.h
 Slice CompressBlock(const Slice& raw,
                     const CompressionOptions& compression_options,
@@ -375,6 +377,7 @@ Slice CompressBlock(const Slice& raw,
         return *compressed_output;
       }
       break;
+    case kZSTD:
     case kZSTDNotFinalCompression:
       if (ZSTD_Compress(compression_options, raw.data(), raw.size(),
                         compressed_output, compression_dict) &&
@@ -390,8 +393,6 @@ Slice CompressBlock(const Slice& raw,
   *type = kNoCompression;
   return raw;
 }
-
-}  // namespace
 
 // kBlockBasedTableMagicNumber was picked by running
 //    echo rocksdb.table.block_based | sha1sum
@@ -463,6 +464,7 @@ struct BlockBasedTableBuilder::Rep {
   uint64_t offset = 0;
   Status status;
   BlockBuilder data_block;
+  BlockBuilder range_del_block;
 
   InternalKeySliceTransform internal_prefix_transform;
   std::unique_ptr<IndexBuilder> index_builder;
@@ -504,6 +506,7 @@ struct BlockBasedTableBuilder::Rep {
         file(f),
         data_block(table_options.block_restart_interval,
                    table_options.use_delta_encoding),
+        range_del_block(1),  // TODO(andrewkr): restart_interval unnecessary
         internal_prefix_transform(_ioptions.prefix_extractor),
         index_builder(
             CreateIndexBuilder(table_options.index_type, &internal_comparator,
@@ -577,42 +580,52 @@ void BlockBasedTableBuilder::Add(const Slice& key, const Slice& value) {
   Rep* r = rep_;
   assert(!r->closed);
   if (!ok()) return;
-  if (r->props.num_entries > 0) {
-    assert(r->internal_comparator.Compare(key, Slice(r->last_key)) > 0);
-  }
-
-  auto should_flush = r->flush_block_policy->Update(key, value);
-  if (should_flush) {
-    assert(!r->data_block.empty());
-    Flush();
-
-    // Add item to index block.
-    // We do not emit the index entry for a block until we have seen the
-    // first key for the next data block.  This allows us to use shorter
-    // keys in the index block.  For example, consider a block boundary
-    // between the keys "the quick brown fox" and "the who".  We can use
-    // "the r" as the key for the index block entry since it is >= all
-    // entries in the first block and < all entries in subsequent
-    // blocks.
-    if (ok()) {
-      r->index_builder->AddIndexEntry(&r->last_key, &key, r->pending_handle);
+  ValueType value_type = ExtractValueType(key);
+  if (IsValueType(value_type)) {
+    if (r->props.num_entries > 0) {
+      assert(r->internal_comparator.Compare(key, Slice(r->last_key)) > 0);
     }
+
+    auto should_flush = r->flush_block_policy->Update(key, value);
+    if (should_flush) {
+      assert(!r->data_block.empty());
+      Flush();
+
+      // Add item to index block.
+      // We do not emit the index entry for a block until we have seen the
+      // first key for the next data block.  This allows us to use shorter
+      // keys in the index block.  For example, consider a block boundary
+      // between the keys "the quick brown fox" and "the who".  We can use
+      // "the r" as the key for the index block entry since it is >= all
+      // entries in the first block and < all entries in subsequent
+      // blocks.
+      if (ok()) {
+        r->index_builder->AddIndexEntry(&r->last_key, &key, r->pending_handle);
+      }
+    }
+
+    if (r->filter_block != nullptr) {
+      r->filter_block->Add(ExtractUserKey(key));
+    }
+
+    r->last_key.assign(key.data(), key.size());
+    r->data_block.Add(key, value);
+    r->props.num_entries++;
+    r->props.raw_key_size += key.size();
+    r->props.raw_value_size += value.size();
+
+    r->index_builder->OnKeyAdded(key);
+    NotifyCollectTableCollectorsOnAdd(key, value, r->offset,
+                                      r->table_properties_collectors,
+                                      r->ioptions.info_log);
+
+  } else if (value_type == kTypeRangeDeletion) {
+    // TODO(wanning&andrewkr) add num_tomestone to table properties
+    r->range_del_block.Add(key, value);
+    ++r->props.num_entries;
+  } else {
+    assert(false);
   }
-
-  if (r->filter_block != nullptr) {
-    r->filter_block->Add(ExtractUserKey(key));
-  }
-
-  r->last_key.assign(key.data(), key.size());
-  r->data_block.Add(key, value);
-  r->props.num_entries++;
-  r->props.raw_key_size += key.size();
-  r->props.raw_value_size += value.size();
-
-  r->index_builder->OnKeyAdded(key);
-  NotifyCollectTableCollectorsOnAdd(key, value, r->offset,
-                                    r->table_properties_collectors,
-                                    r->ioptions.info_log);
 }
 
 void BlockBasedTableBuilder::Flush() {
@@ -651,11 +664,16 @@ void BlockBasedTableBuilder::WriteBlock(const Slice& raw_block_contents,
   auto type = r->compression_type;
   Slice block_contents;
   bool abort_compression = false;
+
+  StopWatchNano timer(r->ioptions.env,
+    ShouldReportDetailedTime(r->ioptions.env, r->ioptions.statistics));
+
   if (raw_block_contents.size() < kCompressionSizeLimit) {
     Slice compression_dict;
     if (is_data_block && r->compression_dict && r->compression_dict->size()) {
       compression_dict = *r->compression_dict;
     }
+
     block_contents = CompressBlock(raw_block_contents, r->compression_opts,
                                    &type, r->table_options.format_version,
                                    compression_dict, &r->compressed_output);
@@ -668,7 +686,8 @@ void BlockBasedTableBuilder::WriteBlock(const Slice& raw_block_contents,
       BlockContents contents;
       Status stat = UncompressBlockContentsForCompressionType(
           block_contents.data(), block_contents.size(), &contents,
-          r->table_options.format_version, compression_dict, type);
+          r->table_options.format_version, compression_dict, type,
+          r->ioptions);
 
       if (stat.ok()) {
         bool compressed_ok = contents.data.compare(raw_block_contents) == 0;
@@ -697,6 +716,14 @@ void BlockBasedTableBuilder::WriteBlock(const Slice& raw_block_contents,
     RecordTick(r->ioptions.statistics, NUMBER_BLOCK_NOT_COMPRESSED);
     type = kNoCompression;
     block_contents = raw_block_contents;
+  } else if (type != kNoCompression &&
+             ShouldReportDetailedTime(r->ioptions.env,
+                                      r->ioptions.statistics)) {
+    MeasureTime(r->ioptions.statistics, COMPRESSION_TIMES_NANOS,
+                timer.ElapsedNanos());
+    MeasureTime(r->ioptions.statistics, BYTES_COMPRESSED,
+                raw_block_contents.size());
+    RecordTick(r->ioptions.statistics, NUMBER_BLOCK_COMPRESSED);
   }
 
   WriteRawBlock(block_contents, type, handle);
@@ -802,7 +829,7 @@ Status BlockBasedTableBuilder::Finish() {
   r->closed = true;
 
   BlockHandle filter_block_handle, metaindex_block_handle, index_block_handle,
-      compression_dict_block_handle;
+      compression_dict_block_handle, range_del_block_handle;
   // Write filter block
   if (ok() && r->filter_block != nullptr) {
     auto filter_contents = r->filter_block->Finish();
@@ -826,9 +853,10 @@ Status BlockBasedTableBuilder::Finish() {
 
   // Write meta blocks and metaindex block with the following order.
   //    1. [meta block: filter]
-  //    2. [other meta blocks]
-  //    3. [meta block: properties]
-  //    4. [metaindex block]
+  //    2. [meta block: properties]
+  //    3. [meta block: compression dictionary]
+  //    4. [meta block: range deletion tombstone]
+  //    5. [metaindex block]
   // write meta blocks
   MetaIndexBuilder meta_index_builder;
   for (const auto& item : index_blocks.meta_blocks) {
@@ -867,6 +895,10 @@ Status BlockBasedTableBuilder::Finish() {
                                          ? r->ioptions.merge_operator->Name()
                                          : "nullptr";
       r->props.compression_name = CompressionTypeToString(r->compression_type);
+      r->props.prefix_extractor_name =
+          r->ioptions.prefix_extractor != nullptr
+              ? r->ioptions.prefix_extractor->Name()
+              : "nullptr";
 
       std::string property_collectors_names = "[";
       property_collectors_names = "[";
@@ -905,6 +937,12 @@ Status BlockBasedTableBuilder::Finish() {
                                compression_dict_block_handle);
       }
     }  // end of properties/compression dictionary block writing
+
+    if (ok() && !r->range_del_block.empty()) {
+      WriteRawBlock(r->range_del_block.Finish(), kNoCompression,
+                    &range_del_block_handle);
+      meta_index_builder.Add(kRangeDelBlock, range_del_block_handle);
+    }  // range deletion tombstone meta block
   }    // meta blocks
 
   // Write index block

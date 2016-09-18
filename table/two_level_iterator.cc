@@ -78,6 +78,10 @@ class TwoLevelIterator : public InternalIterator {
     return pinned_iters_mgr_ && pinned_iters_mgr_->PinningEnabled() &&
            second_level_iter_.iter() && second_level_iter_.IsKeyPinned();
   }
+  virtual bool IsValuePinned() const override {
+    return pinned_iters_mgr_ && pinned_iters_mgr_->PinningEnabled() &&
+           second_level_iter_.iter() && second_level_iter_.IsValuePinned();
+  }
 
  private:
   void SaveError(const Status& s) {
@@ -198,7 +202,7 @@ void TwoLevelIterator::SetSecondLevelIterator(InternalIterator* iter) {
 
   InternalIterator* old_iter = second_level_iter_.Set(iter);
   if (pinned_iters_mgr_ && pinned_iters_mgr_->PinningEnabled()) {
-    pinned_iters_mgr_->PinIteratorIfNeeded(old_iter);
+    pinned_iters_mgr_->PinIterator(old_iter);
   } else {
     delete old_iter;
   }

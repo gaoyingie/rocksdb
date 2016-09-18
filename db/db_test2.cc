@@ -6,7 +6,9 @@
 // Copyright (c) 2011 The LevelDB Authors. All rights reserved.
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file. See the AUTHORS file for names of contributors.
+#include <atomic>
 #include <cstdlib>
+#include <functional>
 
 #include "db/db_test_util.h"
 #include "port/stack_trace.h"
@@ -959,9 +961,9 @@ TEST_F(DBTest2, PresetCompressionDict) {
   compression_types.push_back(kLZ4Compression);
   compression_types.push_back(kLZ4HCCompression);
 #endif                          // LZ4_VERSION_NUMBER >= 10400
-#if ZSTD_VERSION_NUMBER >= 500  // v0.5.0+
-  compression_types.push_back(kZSTDNotFinalCompression);
-#endif  // ZSTD_VERSION_NUMBER >= 500
+  if (ZSTD_Supported()) {
+    compression_types.push_back(kZSTD);
+  }
 
   for (auto compression_type : compression_types) {
     options.compression = compression_type;
@@ -1208,6 +1210,37 @@ class PinL0IndexAndFilterBlocksTest : public DBTestBase,
   PinL0IndexAndFilterBlocksTest() : DBTestBase("/db_pin_l0_index_bloom_test") {}
   virtual void SetUp() override { infinite_max_files_ = GetParam(); }
 
+  void CreateTwoLevels(Options* options) {
+    if (infinite_max_files_) {
+      options->max_open_files = -1;
+    }
+    options->create_if_missing = true;
+    options->statistics = rocksdb::CreateDBStatistics();
+    BlockBasedTableOptions table_options;
+    table_options.cache_index_and_filter_blocks = true;
+    table_options.pin_l0_filter_and_index_blocks_in_cache = true;
+    table_options.filter_policy.reset(NewBloomFilterPolicy(20));
+    options->table_factory.reset(new BlockBasedTableFactory(table_options));
+    CreateAndReopenWithCF({"pikachu"}, *options);
+
+    Put(1, "a", "begin");
+    Put(1, "z", "end");
+    ASSERT_OK(Flush(1));
+    // move this table to L1
+    dbfull()->TEST_CompactRange(0, nullptr, nullptr, handles_[1]);
+
+    // reset block cache
+    table_options.block_cache = NewLRUCache(64 * 1024);
+    options->table_factory.reset(NewBlockBasedTableFactory(table_options));
+    TryReopenWithColumnFamilies({"default", "pikachu"}, *options);
+    // create new table at L0
+    Put(1, "a2", "begin2");
+    Put(1, "z2", "end2");
+    ASSERT_OK(Flush(1));
+
+    table_options.block_cache->EraseUnRefEntries();
+  }
+
   bool infinite_max_files_;
 };
 
@@ -1259,35 +1292,7 @@ TEST_P(PinL0IndexAndFilterBlocksTest,
 TEST_P(PinL0IndexAndFilterBlocksTest,
        MultiLevelIndexAndFilterBlocksCachedWithPinning) {
   Options options = CurrentOptions();
-  if (infinite_max_files_) {
-    options.max_open_files = -1;
-  }
-  options.create_if_missing = true;
-  options.statistics = rocksdb::CreateDBStatistics();
-  BlockBasedTableOptions table_options;
-  table_options.cache_index_and_filter_blocks = true;
-  table_options.pin_l0_filter_and_index_blocks_in_cache = true;
-  table_options.filter_policy.reset(NewBloomFilterPolicy(20));
-  options.table_factory.reset(new BlockBasedTableFactory(table_options));
-  CreateAndReopenWithCF({"pikachu"}, options);
-
-  Put(1, "a", "begin");
-  Put(1, "z", "end");
-  ASSERT_OK(Flush(1));
-  // move this table to L1
-  dbfull()->TEST_CompactRange(0, nullptr, nullptr, handles_[1]);
-
-  // reset block cache
-  table_options.block_cache = NewLRUCache(64 * 1024);
-  options.table_factory.reset(NewBlockBasedTableFactory(table_options));
-  TryReopenWithColumnFamilies({"default", "pikachu"}, options);
-  // create new table at L0
-  Put(1, "a2", "begin2");
-  Put(1, "z2", "end2");
-  ASSERT_OK(Flush(1));
-
-  table_options.block_cache->EraseUnRefEntries();
-
+  PinL0IndexAndFilterBlocksTest::CreateTwoLevels(&options);
   // get base cache values
   uint64_t fm = TestGetTickerCount(options, BLOCK_CACHE_FILTER_MISS);
   uint64_t fh = TestGetTickerCount(options, BLOCK_CACHE_FILTER_HIT);
@@ -1307,14 +1312,125 @@ TEST_P(PinL0IndexAndFilterBlocksTest,
   // the file is opened, prefetching results in a cache filter miss
   // the block is loaded and added to the cache,
   // then the get results in a cache hit for L1
+  // When we have inifinite max_files, there is still cache miss because we have
+  // reset the block cache
   value = Get(1, "a");
   ASSERT_EQ(fm + 1, TestGetTickerCount(options, BLOCK_CACHE_FILTER_MISS));
   ASSERT_EQ(im + 1, TestGetTickerCount(options, BLOCK_CACHE_INDEX_MISS));
 }
 
+TEST_P(PinL0IndexAndFilterBlocksTest, DisablePrefetchingNonL0IndexAndFilter) {
+  Options options = CurrentOptions();
+  PinL0IndexAndFilterBlocksTest::CreateTwoLevels(&options);
+
+  // Get base cache values
+  uint64_t fm = TestGetTickerCount(options, BLOCK_CACHE_FILTER_MISS);
+  uint64_t fh = TestGetTickerCount(options, BLOCK_CACHE_FILTER_HIT);
+  uint64_t im = TestGetTickerCount(options, BLOCK_CACHE_INDEX_MISS);
+  uint64_t ih = TestGetTickerCount(options, BLOCK_CACHE_INDEX_HIT);
+
+  // Reopen database. If max_open_files is set as -1, table readers will be
+  // preloaded. This will trigger a BlockBasedTable::Open() and prefetch
+  // L0 index and filter. Level 1's prefetching is disabled in DB::Open()
+  TryReopenWithColumnFamilies({"default", "pikachu"}, options);
+
+  if (infinite_max_files_) {
+    // After reopen, cache miss are increased by one because we read (and only
+    // read) filter and index on L0
+    ASSERT_EQ(fm + 1, TestGetTickerCount(options, BLOCK_CACHE_FILTER_MISS));
+    ASSERT_EQ(fh, TestGetTickerCount(options, BLOCK_CACHE_FILTER_HIT));
+    ASSERT_EQ(im + 1, TestGetTickerCount(options, BLOCK_CACHE_INDEX_MISS));
+    ASSERT_EQ(ih, TestGetTickerCount(options, BLOCK_CACHE_INDEX_HIT));
+  } else {
+    // If max_open_files is not -1, we do not preload table readers, so there is
+    // no change.
+    ASSERT_EQ(fm, TestGetTickerCount(options, BLOCK_CACHE_FILTER_MISS));
+    ASSERT_EQ(fh, TestGetTickerCount(options, BLOCK_CACHE_FILTER_HIT));
+    ASSERT_EQ(im, TestGetTickerCount(options, BLOCK_CACHE_INDEX_MISS));
+    ASSERT_EQ(ih, TestGetTickerCount(options, BLOCK_CACHE_INDEX_HIT));
+  }
+  std::string value;
+  // this should be read from L0
+  value = Get(1, "a2");
+  // If max_open_files is -1, we have pinned index and filter in Rep, so there
+  // will not be changes in index and filter misses or hits. If max_open_files
+  // is not -1, Get() will open a TableReader and prefetch index and filter.
+  ASSERT_EQ(fm + 1, TestGetTickerCount(options, BLOCK_CACHE_FILTER_MISS));
+  ASSERT_EQ(fh, TestGetTickerCount(options, BLOCK_CACHE_FILTER_HIT));
+  ASSERT_EQ(im + 1, TestGetTickerCount(options, BLOCK_CACHE_INDEX_MISS));
+  ASSERT_EQ(ih, TestGetTickerCount(options, BLOCK_CACHE_INDEX_HIT));
+
+  // this should be read from L1
+  value = Get(1, "a");
+  if (infinite_max_files_) {
+    // In inifinite max files case, there's a cache miss in executing Get()
+    // because index and filter are not prefetched before.
+    ASSERT_EQ(fm + 2, TestGetTickerCount(options, BLOCK_CACHE_FILTER_MISS));
+    ASSERT_EQ(fh, TestGetTickerCount(options, BLOCK_CACHE_FILTER_HIT));
+    ASSERT_EQ(im + 2, TestGetTickerCount(options, BLOCK_CACHE_INDEX_MISS));
+    ASSERT_EQ(ih, TestGetTickerCount(options, BLOCK_CACHE_INDEX_HIT));
+  } else {
+    // In this case, cache miss will be increased by one in
+    // BlockBasedTable::Open() because this is not in DB::Open() code path so we
+    // will prefetch L1's index and filter. Cache hit will also be increased by
+    // one because Get() will read index and filter from the block cache
+    // prefetched in previous Open() call.
+    ASSERT_EQ(fm + 2, TestGetTickerCount(options, BLOCK_CACHE_FILTER_MISS));
+    ASSERT_EQ(fh + 1, TestGetTickerCount(options, BLOCK_CACHE_FILTER_HIT));
+    ASSERT_EQ(im + 2, TestGetTickerCount(options, BLOCK_CACHE_INDEX_MISS));
+    ASSERT_EQ(ih + 1, TestGetTickerCount(options, BLOCK_CACHE_INDEX_HIT));
+  }
+}
+
 INSTANTIATE_TEST_CASE_P(PinL0IndexAndFilterBlocksTest,
                         PinL0IndexAndFilterBlocksTest, ::testing::Bool());
+
 #ifndef ROCKSDB_LITE
+TEST_F(DBTest2, MaxCompactionBytesTest) {
+  Options options = CurrentOptions();
+  options.memtable_factory.reset(
+      new SpecialSkipListFactory(DBTestBase::kNumKeysByGenerateNewRandomFile));
+  options.compaction_style = kCompactionStyleLevel;
+  options.write_buffer_size = 200 << 10;
+  options.arena_block_size = 4 << 10;
+  options.level0_file_num_compaction_trigger = 4;
+  options.num_levels = 4;
+  options.compression = kNoCompression;
+  options.max_bytes_for_level_base = 450 << 10;
+  options.target_file_size_base = 100 << 10;
+  // Infinite for full compaction.
+  options.max_compaction_bytes = options.target_file_size_base * 100;
+
+  Reopen(options);
+
+  Random rnd(301);
+
+  for (int num = 0; num < 8; num++) {
+    GenerateNewRandomFile(&rnd);
+  }
+  CompactRangeOptions cro;
+  cro.bottommost_level_compaction = BottommostLevelCompaction::kForce;
+  ASSERT_OK(db_->CompactRange(cro, nullptr, nullptr));
+  ASSERT_EQ("0,0,8", FilesPerLevel(0));
+
+  // When compact from Ln -> Ln+1, cut a file if the file overlaps with
+  // more than three files in Ln+1.
+  options.max_compaction_bytes = options.target_file_size_base * 3;
+  Reopen(options);
+
+  GenerateNewRandomFile(&rnd);
+  // Add three more small files that overlap with the previous file
+  for (int i = 0; i < 3; i++) {
+    Put("a", "z");
+    ASSERT_OK(Flush());
+  }
+  dbfull()->TEST_WaitForCompact();
+
+  // Output files to L1 are cut to three pieces, according to
+  // options.max_compaction_bytes
+  ASSERT_EQ("0,3,8", FilesPerLevel(0));
+}
+
 static void UniqueIdCallback(void* arg) {
   int* result = reinterpret_cast<int*>(arg);
   if (*result == -1) {
@@ -1438,7 +1554,518 @@ TEST_F(DBTest2, PersistentCache) {
     }
   }
 }
+
+namespace {
+void CountSyncPoint() {
+  TEST_SYNC_POINT_CALLBACK("DBTest2::MarkedPoint", nullptr /* arg */);
+}
+}  // namespace
+
+TEST_F(DBTest2, SyncPointMarker) {
+  std::atomic<int> sync_point_called(0);
+  rocksdb::SyncPoint::GetInstance()->SetCallBack(
+      "DBTest2::MarkedPoint",
+      [&](void* arg) { sync_point_called.fetch_add(1); });
+
+  // The first dependency enforces Marker can be loaded before MarkedPoint.
+  // The second checks that thread 1's MarkedPoint should be disabled here.
+  // Execution order:
+  // |   Thread 1    |  Thread 2   |
+  // |               |   Marker    |
+  // |  MarkedPoint  |             |
+  // | Thread1First  |             |
+  // |               | MarkedPoint |
+  rocksdb::SyncPoint::GetInstance()->LoadDependencyAndMarkers(
+      {{"DBTest2::SyncPointMarker:Thread1First", "DBTest2::MarkedPoint"}},
+      {{"DBTest2::SyncPointMarker:Marker", "DBTest2::MarkedPoint"}});
+
+  rocksdb::SyncPoint::GetInstance()->EnableProcessing();
+
+  std::function<void()> func1 = [&]() {
+    CountSyncPoint();
+    TEST_SYNC_POINT("DBTest2::SyncPointMarker:Thread1First");
+  };
+
+  std::function<void()> func2 = [&]() {
+    TEST_SYNC_POINT("DBTest2::SyncPointMarker:Marker");
+    CountSyncPoint();
+  };
+
+  auto thread1 = std::thread(func1);
+  auto thread2 = std::thread(func2);
+  thread1.join();
+  thread2.join();
+
+  // Callback is only executed once
+  ASSERT_EQ(sync_point_called.load(), 1);
+  rocksdb::SyncPoint::GetInstance()->DisableProcessing();
+}
 #endif
+
+class MergeOperatorPinningTest : public DBTest2,
+                                 public testing::WithParamInterface<bool> {
+ public:
+  MergeOperatorPinningTest() { disable_block_cache_ = GetParam(); }
+
+  bool disable_block_cache_;
+};
+
+INSTANTIATE_TEST_CASE_P(MergeOperatorPinningTest, MergeOperatorPinningTest,
+                        ::testing::Bool());
+
+#ifndef ROCKSDB_LITE
+TEST_P(MergeOperatorPinningTest, OperandsMultiBlocks) {
+  Options options = CurrentOptions();
+  BlockBasedTableOptions table_options;
+  table_options.block_size = 1;  // every block will contain one entry
+  table_options.no_block_cache = disable_block_cache_;
+  options.table_factory.reset(NewBlockBasedTableFactory(table_options));
+  options.merge_operator = MergeOperators::CreateStringAppendTESTOperator();
+  options.level0_slowdown_writes_trigger = (1 << 30);
+  options.level0_stop_writes_trigger = (1 << 30);
+  options.disable_auto_compactions = true;
+  DestroyAndReopen(options);
+
+  const int kKeysPerFile = 10;
+  const int kOperandsPerKeyPerFile = 7;
+  const int kOperandSize = 100;
+  // Filse to write in L0 before compacting to lower level
+  const int kFilesPerLevel = 3;
+
+  Random rnd(301);
+  std::map<std::string, std::string> true_data;
+  int batch_num = 1;
+  int lvl_to_fill = 4;
+  int key_id = 0;
+  while (true) {
+    for (int j = 0; j < kKeysPerFile; j++) {
+      std::string key = Key(key_id % 35);
+      key_id++;
+      for (int k = 0; k < kOperandsPerKeyPerFile; k++) {
+        std::string val = RandomString(&rnd, kOperandSize);
+        ASSERT_OK(db_->Merge(WriteOptions(), key, val));
+        if (true_data[key].size() == 0) {
+          true_data[key] = val;
+        } else {
+          true_data[key] += "," + val;
+        }
+      }
+    }
+
+    if (lvl_to_fill == -1) {
+      // Keep last batch in memtable and stop
+      break;
+    }
+
+    ASSERT_OK(Flush());
+    if (batch_num % kFilesPerLevel == 0) {
+      if (lvl_to_fill != 0) {
+        MoveFilesToLevel(lvl_to_fill);
+      }
+      lvl_to_fill--;
+    }
+    batch_num++;
+  }
+
+  // 3 L0 files
+  // 1 L1 file
+  // 3 L2 files
+  // 1 L3 file
+  // 3 L4 Files
+  ASSERT_EQ(FilesPerLevel(), "3,1,3,1,3");
+
+  VerifyDBFromMap(true_data);
+}
+
+TEST_P(MergeOperatorPinningTest, Randomized) {
+  do {
+    Options options = CurrentOptions();
+    options.merge_operator = MergeOperators::CreateMaxOperator();
+    BlockBasedTableOptions table_options;
+    table_options.no_block_cache = disable_block_cache_;
+    options.table_factory.reset(NewBlockBasedTableFactory(table_options));
+    DestroyAndReopen(options);
+
+    Random rnd(301);
+    std::map<std::string, std::string> true_data;
+
+    const int kTotalMerges = 10000;
+    // Every key gets ~10 operands
+    const int kKeyRange = kTotalMerges / 10;
+    const int kOperandSize = 20;
+    const int kNumPutBefore = kKeyRange / 10;  // 10% value
+    const int kNumPutAfter = kKeyRange / 10;   // 10% overwrite
+    const int kNumDelete = kKeyRange / 10;     // 10% delete
+
+    // kNumPutBefore keys will have base values
+    for (int i = 0; i < kNumPutBefore; i++) {
+      std::string key = Key(rnd.Next() % kKeyRange);
+      std::string value = RandomString(&rnd, kOperandSize);
+      ASSERT_OK(db_->Put(WriteOptions(), key, value));
+
+      true_data[key] = value;
+    }
+
+    // Do kTotalMerges merges
+    for (int i = 0; i < kTotalMerges; i++) {
+      std::string key = Key(rnd.Next() % kKeyRange);
+      std::string value = RandomString(&rnd, kOperandSize);
+      ASSERT_OK(db_->Merge(WriteOptions(), key, value));
+
+      if (true_data[key] < value) {
+        true_data[key] = value;
+      }
+    }
+
+    // Overwrite random kNumPutAfter keys
+    for (int i = 0; i < kNumPutAfter; i++) {
+      std::string key = Key(rnd.Next() % kKeyRange);
+      std::string value = RandomString(&rnd, kOperandSize);
+      ASSERT_OK(db_->Put(WriteOptions(), key, value));
+
+      true_data[key] = value;
+    }
+
+    // Delete random kNumDelete keys
+    for (int i = 0; i < kNumDelete; i++) {
+      std::string key = Key(rnd.Next() % kKeyRange);
+      ASSERT_OK(db_->Delete(WriteOptions(), key));
+
+      true_data.erase(key);
+    }
+
+    VerifyDBFromMap(true_data);
+
+    // Skip HashCuckoo since it does not support merge operators
+  } while (ChangeOptions(kSkipMergePut | kSkipHashCuckoo));
+}
+
+class MergeOperatorHook : public MergeOperator {
+ public:
+  explicit MergeOperatorHook(std::shared_ptr<MergeOperator> _merge_op)
+      : merge_op_(_merge_op) {}
+
+  virtual bool FullMergeV2(const MergeOperationInput& merge_in,
+                           MergeOperationOutput* merge_out) const override {
+    before_merge_();
+    bool res = merge_op_->FullMergeV2(merge_in, merge_out);
+    after_merge_();
+    return res;
+  }
+
+  virtual const char* Name() const override { return merge_op_->Name(); }
+
+  std::shared_ptr<MergeOperator> merge_op_;
+  std::function<void()> before_merge_ = []() {};
+  std::function<void()> after_merge_ = []() {};
+};
+
+TEST_P(MergeOperatorPinningTest, EvictCacheBeforeMerge) {
+  Options options = CurrentOptions();
+
+  auto merge_hook =
+      std::make_shared<MergeOperatorHook>(MergeOperators::CreateMaxOperator());
+  options.merge_operator = merge_hook;
+  options.disable_auto_compactions = true;
+  options.level0_slowdown_writes_trigger = (1 << 30);
+  options.level0_stop_writes_trigger = (1 << 30);
+  options.max_open_files = 20;
+  BlockBasedTableOptions bbto;
+  bbto.no_block_cache = disable_block_cache_;
+  if (bbto.no_block_cache == false) {
+    bbto.block_cache = NewLRUCache(64 * 1024 * 1024);
+  } else {
+    bbto.block_cache = nullptr;
+  }
+  options.table_factory.reset(NewBlockBasedTableFactory(bbto));
+  DestroyAndReopen(options);
+
+  const int kNumOperands = 30;
+  const int kNumKeys = 1000;
+  const int kOperandSize = 100;
+  Random rnd(301);
+
+  // 1000 keys every key have 30 operands, every operand is in a different file
+  std::map<std::string, std::string> true_data;
+  for (int i = 0; i < kNumOperands; i++) {
+    for (int j = 0; j < kNumKeys; j++) {
+      std::string k = Key(j);
+      std::string v = RandomString(&rnd, kOperandSize);
+      ASSERT_OK(db_->Merge(WriteOptions(), k, v));
+
+      true_data[k] = std::max(true_data[k], v);
+    }
+    ASSERT_OK(Flush());
+  }
+
+  std::vector<uint64_t> file_numbers = ListTableFiles(env_, dbname_);
+  ASSERT_EQ(file_numbers.size(), kNumOperands);
+  int merge_cnt = 0;
+
+  // Code executed before merge operation
+  merge_hook->before_merge_ = [&]() {
+    // Evict all tables from cache before every merge operation
+    for (uint64_t num : file_numbers) {
+      TableCache::Evict(dbfull()->TEST_table_cache(), num);
+    }
+    // Decrease cache capacity to force all unrefed blocks to be evicted
+    if (bbto.block_cache) {
+      bbto.block_cache->SetCapacity(1);
+    }
+    merge_cnt++;
+  };
+
+  // Code executed after merge operation
+  merge_hook->after_merge_ = [&]() {
+    // Increase capacity again after doing the merge
+    if (bbto.block_cache) {
+      bbto.block_cache->SetCapacity(64 * 1024 * 1024);
+    }
+  };
+
+  size_t total_reads;
+  VerifyDBFromMap(true_data, &total_reads);
+  ASSERT_EQ(merge_cnt, total_reads);
+
+  db_->CompactRange(CompactRangeOptions(), nullptr, nullptr);
+
+  VerifyDBFromMap(true_data, &total_reads);
+}
+
+TEST_P(MergeOperatorPinningTest, TailingIterator) {
+  Options options = CurrentOptions();
+  options.merge_operator = MergeOperators::CreateMaxOperator();
+  BlockBasedTableOptions bbto;
+  bbto.no_block_cache = disable_block_cache_;
+  options.table_factory.reset(NewBlockBasedTableFactory(bbto));
+  DestroyAndReopen(options);
+
+  const int kNumOperands = 100;
+  const int kNumWrites = 100000;
+
+  std::function<void()> writer_func = [&]() {
+    int k = 0;
+    for (int i = 0; i < kNumWrites; i++) {
+      db_->Merge(WriteOptions(), Key(k), Key(k));
+
+      if (i && i % kNumOperands == 0) {
+        k++;
+      }
+      if (i && i % 127 == 0) {
+        ASSERT_OK(Flush());
+      }
+      if (i && i % 317 == 0) {
+        ASSERT_OK(db_->CompactRange(CompactRangeOptions(), nullptr, nullptr));
+      }
+    }
+  };
+
+  std::function<void()> reader_func = [&]() {
+    ReadOptions ro;
+    ro.tailing = true;
+    Iterator* iter = db_->NewIterator(ro);
+
+    iter->SeekToFirst();
+    for (int i = 0; i < (kNumWrites / kNumOperands); i++) {
+      while (!iter->Valid()) {
+        // wait for the key to be written
+        env_->SleepForMicroseconds(100);
+        iter->Seek(Key(i));
+      }
+      ASSERT_EQ(iter->key(), Key(i));
+      ASSERT_EQ(iter->value(), Key(i));
+
+      iter->Next();
+    }
+
+    delete iter;
+  };
+
+  std::thread writer_thread(writer_func);
+  std::thread reader_thread(reader_func);
+
+  writer_thread.join();
+  reader_thread.join();
+}
+#endif  // ROCKSDB_LITE
+
+TEST_F(DBTest2, MaxSuccessiveMergesInRecovery) {
+  Options options;
+  options = CurrentOptions(options);
+  options.merge_operator = MergeOperators::CreatePutOperator();
+  DestroyAndReopen(options);
+
+  db_->Put(WriteOptions(), "foo", "bar");
+  ASSERT_OK(db_->Merge(WriteOptions(), "foo", "bar"));
+  ASSERT_OK(db_->Merge(WriteOptions(), "foo", "bar"));
+  ASSERT_OK(db_->Merge(WriteOptions(), "foo", "bar"));
+  ASSERT_OK(db_->Merge(WriteOptions(), "foo", "bar"));
+  ASSERT_OK(db_->Merge(WriteOptions(), "foo", "bar"));
+
+  options.max_successive_merges = 3;
+  Reopen(options);
+}
+
+size_t GetEncodedEntrySize(size_t key_size, size_t value_size) {
+  std::string buffer;
+
+  PutVarint32(&buffer, static_cast<uint32_t>(0));
+  PutVarint32(&buffer, static_cast<uint32_t>(key_size));
+  PutVarint32(&buffer, static_cast<uint32_t>(value_size));
+
+  return buffer.size() + key_size + value_size;
+}
+
+TEST_F(DBTest2, ReadAmpBitmap) {
+  Options options = CurrentOptions();
+  BlockBasedTableOptions bbto;
+  // Disable delta encoding to make it easier to calculate read amplification
+  bbto.use_delta_encoding = false;
+  // Huge block cache to make it easier to calculate read amplification
+  bbto.block_cache = NewLRUCache(1024 * 1024 * 1024);
+  bbto.read_amp_bytes_per_bit = 16;
+  options.table_factory.reset(NewBlockBasedTableFactory(bbto));
+  options.statistics = rocksdb::CreateDBStatistics();
+  DestroyAndReopen(options);
+
+  const size_t kNumEntries = 10000;
+
+  Random rnd(301);
+  for (size_t i = 0; i < kNumEntries; i++) {
+    ASSERT_OK(Put(Key(static_cast<int>(i)), RandomString(&rnd, 100)));
+  }
+  ASSERT_OK(Flush());
+
+  Close();
+  Reopen(options);
+
+  // Read keys/values randomly and verify that reported read amp error
+  // is less than 2%
+  uint64_t total_useful_bytes = 0;
+  std::set<int> read_keys;
+  std::string value;
+  for (size_t i = 0; i < kNumEntries * 5; i++) {
+    int key_idx = rnd.Next() % kNumEntries;
+    std::string k = Key(key_idx);
+    ASSERT_OK(db_->Get(ReadOptions(), k, &value));
+
+    if (read_keys.find(key_idx) == read_keys.end()) {
+      auto ik = InternalKey(k, 0, ValueType::kTypeValue);
+      total_useful_bytes += GetEncodedEntrySize(ik.size(), value.size());
+      read_keys.insert(key_idx);
+    }
+
+    double expected_read_amp =
+        static_cast<double>(total_useful_bytes) /
+        options.statistics->getTickerCount(READ_AMP_TOTAL_READ_BYTES);
+
+    double read_amp =
+        static_cast<double>(options.statistics->getTickerCount(
+            READ_AMP_ESTIMATE_USEFUL_BYTES)) /
+        options.statistics->getTickerCount(READ_AMP_TOTAL_READ_BYTES);
+
+    double error_pct = fabs(expected_read_amp - read_amp) * 100;
+    // Error between reported read amp and real read amp should be less than 2%
+    EXPECT_LE(error_pct, 2);
+  }
+
+  // Make sure we read every thing in the DB (which is smaller than our cache)
+  Iterator* iter = db_->NewIterator(ReadOptions());
+  for (iter->SeekToFirst(); iter->Valid(); iter->Next()) {
+    ASSERT_EQ(iter->value().ToString(), Get(iter->key().ToString()));
+  }
+  delete iter;
+
+  // Read amp is 100% since we read all what we loaded in memory
+  ASSERT_EQ(options.statistics->getTickerCount(READ_AMP_ESTIMATE_USEFUL_BYTES),
+            options.statistics->getTickerCount(READ_AMP_TOTAL_READ_BYTES));
+}
+
+TEST_F(DBTest2, ReadAmpBitmapLiveInCacheAfterDBClose) {
+  if (dbname_.find("dev/shm") != std::string::npos) {
+    // /dev/shm dont support getting a unique file id, this mean that
+    // running this test on /dev/shm will fail because lru_cache will load
+    // the blocks again regardless of them being already in the cache
+    return;
+  }
+
+  std::shared_ptr<Cache> lru_cache = NewLRUCache(1024 * 1024 * 1024);
+  std::shared_ptr<Statistics> stats = rocksdb::CreateDBStatistics();
+
+  Options options = CurrentOptions();
+  BlockBasedTableOptions bbto;
+  // Disable delta encoding to make it easier to calculate read amplification
+  bbto.use_delta_encoding = false;
+  // Huge block cache to make it easier to calculate read amplification
+  bbto.block_cache = lru_cache;
+  bbto.read_amp_bytes_per_bit = 16;
+  options.table_factory.reset(NewBlockBasedTableFactory(bbto));
+  options.statistics = stats;
+  DestroyAndReopen(options);
+
+  const int kNumEntries = 10000;
+
+  Random rnd(301);
+  for (int i = 0; i < kNumEntries; i++) {
+    ASSERT_OK(Put(Key(i), RandomString(&rnd, 100)));
+  }
+  ASSERT_OK(Flush());
+
+  Close();
+  Reopen(options);
+
+  uint64_t total_useful_bytes = 0;
+  std::set<int> read_keys;
+  std::string value;
+  // Iter1: Read half the DB, Read even keys
+  // Key(0), Key(2), Key(4), Key(6), Key(8), ...
+  for (int i = 0; i < kNumEntries; i += 2) {
+    std::string k = Key(i);
+    ASSERT_OK(db_->Get(ReadOptions(), k, &value));
+
+    if (read_keys.find(i) == read_keys.end()) {
+      auto ik = InternalKey(k, 0, ValueType::kTypeValue);
+      total_useful_bytes += GetEncodedEntrySize(ik.size(), value.size());
+      read_keys.insert(i);
+    }
+  }
+
+  size_t total_useful_bytes_iter1 =
+      options.statistics->getTickerCount(READ_AMP_ESTIMATE_USEFUL_BYTES);
+  size_t total_loaded_bytes_iter1 =
+      options.statistics->getTickerCount(READ_AMP_TOTAL_READ_BYTES);
+
+  Close();
+  std::shared_ptr<Statistics> new_statistics = rocksdb::CreateDBStatistics();
+  // Destroy old statistics obj that the blocks in lru_cache are pointing to
+  options.statistics.reset();
+  // Use the statistics object that we just created
+  options.statistics = new_statistics;
+  Reopen(options);
+
+  // Iter2: Read half the DB, Read odd keys
+  // Key(1), Key(3), Key(5), Key(7), Key(9), ...
+  for (int i = 1; i < kNumEntries; i += 2) {
+    std::string k = Key(i);
+    ASSERT_OK(db_->Get(ReadOptions(), k, &value));
+
+    if (read_keys.find(i) == read_keys.end()) {
+      auto ik = InternalKey(k, 0, ValueType::kTypeValue);
+      total_useful_bytes += GetEncodedEntrySize(ik.size(), value.size());
+      read_keys.insert(i);
+    }
+  }
+
+  size_t total_useful_bytes_iter2 =
+      options.statistics->getTickerCount(READ_AMP_ESTIMATE_USEFUL_BYTES);
+  size_t total_loaded_bytes_iter2 =
+      options.statistics->getTickerCount(READ_AMP_TOTAL_READ_BYTES);
+
+  // We reached read_amp of 100% because we read all the keys in the DB
+  ASSERT_EQ(total_useful_bytes_iter1 + total_useful_bytes_iter2,
+            total_loaded_bytes_iter1 + total_loaded_bytes_iter2);
+}
+
 }  // namespace rocksdb
 
 int main(int argc, char** argv) {

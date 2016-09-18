@@ -44,8 +44,7 @@ MemTableOptions::MemTableOptions(const ImmutableCFOptions& ioptions,
               static_cast<double>(mutable_cf_options.write_buffer_size) *
               mutable_cf_options.memtable_prefix_bloom_size_ratio) *
           8u),
-      memtable_prefix_bloom_huge_page_tlb_size(
-          mutable_cf_options.memtable_prefix_bloom_huge_page_tlb_size),
+      memtable_huge_page_size(mutable_cf_options.memtable_huge_page_size),
       inplace_update_support(ioptions.inplace_update_support),
       inplace_update_num_locks(mutable_cf_options.inplace_update_num_locks),
       inplace_callback(ioptions.inplace_callback),
@@ -63,7 +62,8 @@ MemTable::MemTable(const InternalKeyComparator& cmp,
       moptions_(ioptions, mutable_cf_options),
       refs_(0),
       kArenaBlockSize(OptimizeBlockSize(moptions_.arena_block_size)),
-      arena_(moptions_.arena_block_size, 0),
+      arena_(moptions_.arena_block_size,
+             mutable_cf_options.memtable_huge_page_size),
       allocator_(&arena_, write_buffer_manager),
       table_(ioptions.memtable_factory->CreateMemTableRep(
           comparator_, &allocator_, ioptions.prefix_extractor,
@@ -92,7 +92,7 @@ MemTable::MemTable(const InternalKeyComparator& cmp,
     prefix_bloom_.reset(new DynamicBloom(
         &allocator_, moptions_.memtable_prefix_bloom_bits,
         ioptions.bloom_locality, 6 /* hard coded 6 probes */, nullptr,
-        moptions_.memtable_prefix_bloom_huge_page_tlb_size, ioptions.info_log));
+        moptions_.memtable_huge_page_size, ioptions.info_log));
   }
 }
 
@@ -218,12 +218,13 @@ const char* EncodeKey(std::string* scratch, const Slice& target) {
 
 class MemTableIterator : public InternalIterator {
  public:
-  MemTableIterator(
-      const MemTable& mem, const ReadOptions& read_options, Arena* arena)
+  MemTableIterator(const MemTable& mem, const ReadOptions& read_options,
+                   Arena* arena)
       : bloom_(nullptr),
         prefix_extractor_(mem.prefix_extractor_),
         valid_(false),
-        arena_mode_(arena != nullptr) {
+        arena_mode_(arena != nullptr),
+        value_pinned_(!mem.GetMemTableOptions()->inplace_update_support) {
     if (prefix_extractor_ != nullptr && !read_options.total_order_seek) {
       bloom_ = mem.prefix_bloom_.get();
       iter_ = mem.table_->GetDynamicPrefixIterator(arena);
@@ -306,12 +307,18 @@ class MemTableIterator : public InternalIterator {
     return true;
   }
 
+  virtual bool IsValuePinned() const override {
+    // memtable value is always pinned, except if we allow inplace update.
+    return value_pinned_;
+  }
+
  private:
   DynamicBloom* bloom_;
   const SliceTransform* const prefix_extractor_;
   MemTableRep::Iterator* iter_;
   bool valid_;
   bool arena_mode_;
+  bool value_pinned_;
 
   // No copying allowed
   MemTableIterator(const MemTableIterator&);
@@ -352,7 +359,8 @@ uint64_t MemTable::ApproximateSize(const Slice& start_ikey,
 
 void MemTable::Add(SequenceNumber s, ValueType type,
                    const Slice& key, /* user key */
-                   const Slice& value, bool allow_concurrent) {
+                   const Slice& value, bool allow_concurrent,
+                   MemTablePostProcessInfo* post_process_info) {
   // Format of an entry is concatenation of:
   //  key_size     : varint32 of internal_key.size()
   //  key bytes    : char[internal_key.size()]
@@ -406,13 +414,16 @@ void MemTable::Add(SequenceNumber s, ValueType type,
       }
       assert(first_seqno_.load() >= earliest_seqno_.load());
     }
+    assert(post_process_info == nullptr);
+    UpdateFlushState();
   } else {
     table_->InsertConcurrently(handle);
 
-    num_entries_.fetch_add(1, std::memory_order_relaxed);
-    data_size_.fetch_add(encoded_len, std::memory_order_relaxed);
+    assert(post_process_info != nullptr);
+    post_process_info->num_entries++;
+    post_process_info->data_size += encoded_len;
     if (type == kTypeDeletion) {
-      num_deletes_.fetch_add(1, std::memory_order_relaxed);
+      post_process_info->num_deletes++;
     }
 
     if (prefix_bloom_) {
@@ -432,8 +443,6 @@ void MemTable::Add(SequenceNumber s, ValueType type,
         !first_seqno_.compare_exchange_weak(cur_earliest_seqno, s)) {
     }
   }
-
-  UpdateFlushState();
 }
 
 // Callback from MemTable::Get()
@@ -506,7 +515,6 @@ static bool SaveValue(void* arg, const char* entry) {
       case kTypeDeletion:
       case kTypeSingleDeletion: {
         if (*(s->merge_in_progress)) {
-          *(s->status) = Status::OK();
           *(s->status) = MergeHelper::TimedFullMerge(
               merge_operator, s->key->user_key(), nullptr,
               merge_context->GetOperands(), s->value, s->logger, s->statistics,
@@ -530,7 +538,8 @@ static bool SaveValue(void* arg, const char* entry) {
         }
         Slice v = GetLengthPrefixedSlice(key_ptr + key_length);
         *(s->merge_in_progress) = true;
-        merge_context->PushOperand(v);
+        merge_context->PushOperand(
+            v, s->inplace_update_support == false /* operand_pinned */);
         return true;
       }
       default:

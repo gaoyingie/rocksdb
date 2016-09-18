@@ -30,6 +30,8 @@ SpecialEnv::SpecialEnv(Env* base)
   manifest_write_error_.store(false, std::memory_order_release);
   log_write_error_.store(false, std::memory_order_release);
   random_file_open_counter_.store(0, std::memory_order_relaxed);
+  delete_count_.store(0, std::memory_order_relaxed);
+  num_open_wal_file_.store(0);
   log_write_slowdown_ = 0;
   bytes_written_ = 0;
   sync_counter_ = 0;
@@ -442,7 +444,7 @@ void DBTestBase::Reopen(const Options& options) {
 
 void DBTestBase::Close() {
   for (auto h : handles_) {
-    delete h;
+    db_->DestroyColumnFamilyHandle(h);
   }
   handles_.clear();
   delete db_;
@@ -730,7 +732,7 @@ double DBTestBase::CompressionRatioAtLevel(int level, int cf) {
 
 int DBTestBase::TotalTableFiles(int cf, int levels) {
   if (levels == -1) {
-    levels = CurrentOptions().num_levels;
+    levels = (cf == 0) ? db_->NumberLevels() : db_->NumberLevels(handles_[1]);
   }
   int result = 0;
   for (int level = 0; level < levels; level++) {
@@ -1074,6 +1076,92 @@ std::vector<std::uint64_t> DBTestBase::ListTableFiles(Env* env,
   return file_numbers;
 }
 
+void DBTestBase::VerifyDBFromMap(std::map<std::string, std::string> true_data,
+                                 size_t* total_reads_res) {
+  size_t total_reads = 0;
+
+  for (auto& kv : true_data) {
+    ASSERT_EQ(Get(kv.first), kv.second);
+    total_reads++;
+  }
+
+  // Normal Iterator
+  {
+    int iter_cnt = 0;
+    ReadOptions ro;
+    ro.total_order_seek = true;
+    Iterator* iter = db_->NewIterator(ro);
+    // Verify Iterator::Next()
+    iter_cnt = 0;
+    auto data_iter = true_data.begin();
+    for (iter->SeekToFirst(); iter->Valid(); iter->Next(), data_iter++) {
+      ASSERT_EQ(iter->key().ToString(), data_iter->first);
+      ASSERT_EQ(iter->value().ToString(), data_iter->second);
+      iter_cnt++;
+      total_reads++;
+    }
+    ASSERT_EQ(data_iter, true_data.end()) << iter_cnt << " / "
+                                          << true_data.size();
+
+    // Verify Iterator::Prev()
+    iter_cnt = 0;
+    auto data_rev = true_data.rbegin();
+    for (iter->SeekToLast(); iter->Valid(); iter->Prev(), data_rev++) {
+      ASSERT_EQ(iter->key().ToString(), data_rev->first);
+      ASSERT_EQ(iter->value().ToString(), data_rev->second);
+      iter_cnt++;
+      total_reads++;
+    }
+    ASSERT_EQ(data_rev, true_data.rend()) << iter_cnt << " / "
+                                          << true_data.size();
+
+    // Verify Iterator::Seek()
+    for (auto kv : true_data) {
+      iter->Seek(kv.first);
+      ASSERT_EQ(kv.first, iter->key().ToString());
+      ASSERT_EQ(kv.second, iter->value().ToString());
+      total_reads++;
+    }
+
+    delete iter;
+  }
+
+#ifndef ROCKSDB_LITE
+  // Tailing iterator
+  int iter_cnt = 0;
+  ReadOptions ro;
+  ro.tailing = true;
+  ro.total_order_seek = true;
+  Iterator* iter = db_->NewIterator(ro);
+
+  // Verify ForwardIterator::Next()
+  iter_cnt = 0;
+  auto data_iter = true_data.begin();
+  for (iter->SeekToFirst(); iter->Valid(); iter->Next(), data_iter++) {
+    ASSERT_EQ(iter->key().ToString(), data_iter->first);
+    ASSERT_EQ(iter->value().ToString(), data_iter->second);
+    iter_cnt++;
+    total_reads++;
+  }
+  ASSERT_EQ(data_iter, true_data.end()) << iter_cnt << " / "
+                                        << true_data.size();
+
+  // Verify ForwardIterator::Seek()
+  for (auto kv : true_data) {
+    iter->Seek(kv.first);
+    ASSERT_EQ(kv.first, iter->key().ToString());
+    ASSERT_EQ(kv.second, iter->value().ToString());
+    total_reads++;
+  }
+
+  delete iter;
+#endif  // ROCKSDB_LITE
+
+  if (total_reads_res) {
+    *total_reads_res = total_reads;
+  }
+}
+
 #ifndef ROCKSDB_LITE
 
 Status DBTestBase::GenerateAndAddExternalFile(const Options options,
@@ -1098,7 +1186,7 @@ Status DBTestBase::GenerateAndAddExternalFile(const Options options,
   s = sst_file_writer.Finish();
 
   if (s.ok()) {
-    s = db_->AddFile(file_path);
+    s = db_->AddFile(std::vector<std::string>(1, file_path));
   }
 
   return s;

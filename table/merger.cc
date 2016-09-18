@@ -257,6 +257,12 @@ class MergingIterator : public InternalIterator {
            current_->IsKeyPinned();
   }
 
+  virtual bool IsValuePinned() const override {
+    assert(Valid());
+    return pinned_iters_mgr_ && pinned_iters_mgr_->PinningEnabled() &&
+           current_->IsValuePinned();
+  }
+
  private:
   // Clears heaps for both directions, used when changing direction or seeking
   void ClearHeaps();
@@ -330,7 +336,6 @@ InternalIterator* NewMergingIterator(const Comparator* cmp,
 MergeIteratorBuilder::MergeIteratorBuilder(const Comparator* comparator,
                                            Arena* a)
     : first_iter(nullptr), use_merging_iter(false), arena(a) {
-
   auto mem = arena->AllocateAligned(sizeof(MergingIterator));
   merge_iter = new (mem) MergingIterator(comparator, nullptr, 0, true);
 }

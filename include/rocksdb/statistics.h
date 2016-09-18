@@ -68,6 +68,11 @@ enum Tickers : uint32_t {
   // # persistent cache miss
   PERSISTENT_CACHE_MISS,
 
+  // # total simulation block cache hits
+  SIM_BLOCK_CACHE_HIT,
+  // # total simulation block cache misses
+  SIM_BLOCK_CACHE_MISS,
+
   // # of memtable hits.
   MEMTABLE_HIT,
   // # of memtable misses.
@@ -179,6 +184,11 @@ enum Tickers : uint32_t {
   NUMBER_SUPERVERSION_ACQUIRES,
   NUMBER_SUPERVERSION_RELEASES,
   NUMBER_SUPERVERSION_CLEANUPS,
+
+  // # of compressions/decompressions executed
+  NUMBER_BLOCK_COMPRESSED,
+  NUMBER_BLOCK_DECOMPRESSED,
+
   NUMBER_BLOCK_NOT_COMPRESSED,
   MERGE_OPERATION_TOTAL_TIME,
   FILTER_OPERATION_TOTAL_TIME,
@@ -186,6 +196,14 @@ enum Tickers : uint32_t {
   // Row cache.
   ROW_CACHE_HIT,
   ROW_CACHE_MISS,
+
+  // Read amplification statistics.
+  // Read amplification can be calculated using this formula
+  // (READ_AMP_TOTAL_READ_BYTES / READ_AMP_ESTIMATE_USEFUL_BYTES)
+  //
+  // REQUIRES: ReadOptions::read_amp_bytes_per_bit to be enabled
+  READ_AMP_ESTIMATE_USEFUL_BYTES,  // Estimate of total bytes actually used.
+  READ_AMP_TOTAL_READ_BYTES,       // Total size of loaded data blocks.
 
   TICKER_ENUM_MAX
 };
@@ -211,6 +229,10 @@ const std::vector<std::pair<Tickers, std::string>> TickersNameMap = {
     {BLOCK_CACHE_BYTES_READ, "rocksdb.block.cache.bytes.read"},
     {BLOCK_CACHE_BYTES_WRITE, "rocksdb.block.cache.bytes.write"},
     {BLOOM_FILTER_USEFUL, "rocksdb.bloom.filter.useful"},
+    {PERSISTENT_CACHE_HIT, "rocksdb.persistent.cache.hit"},
+    {PERSISTENT_CACHE_MISS, "rocksdb.persistent.cache.miss"},
+    {SIM_BLOCK_CACHE_HIT, "rocksdb.sim.block.cache.hit"},
+    {SIM_BLOCK_CACHE_MISS, "rocksdb.sim.block.cache.miss"},
     {MEMTABLE_HIT, "rocksdb.memtable.hit"},
     {MEMTABLE_MISS, "rocksdb.memtable.miss"},
     {GET_HIT_L0, "rocksdb.l0.hit"},
@@ -260,20 +282,25 @@ const std::vector<std::pair<Tickers, std::string>> TickersNameMap = {
     {WAL_FILE_BYTES, "rocksdb.wal.bytes"},
     {WRITE_DONE_BY_SELF, "rocksdb.write.self"},
     {WRITE_DONE_BY_OTHER, "rocksdb.write.other"},
+    {WRITE_TIMEDOUT, "rocksdb.write.timeout"},
     {WRITE_WITH_WAL, "rocksdb.write.wal"},
-    {FLUSH_WRITE_BYTES, "rocksdb.flush.write.bytes"},
     {COMPACT_READ_BYTES, "rocksdb.compact.read.bytes"},
     {COMPACT_WRITE_BYTES, "rocksdb.compact.write.bytes"},
+    {FLUSH_WRITE_BYTES, "rocksdb.flush.write.bytes"},
     {NUMBER_DIRECT_LOAD_TABLE_PROPERTIES,
      "rocksdb.number.direct.load.table.properties"},
     {NUMBER_SUPERVERSION_ACQUIRES, "rocksdb.number.superversion_acquires"},
     {NUMBER_SUPERVERSION_RELEASES, "rocksdb.number.superversion_releases"},
     {NUMBER_SUPERVERSION_CLEANUPS, "rocksdb.number.superversion_cleanups"},
+    {NUMBER_BLOCK_COMPRESSED, "rocksdb.number.block.compressed"},
+    {NUMBER_BLOCK_DECOMPRESSED, "rocksdb.number.block.decompressed"},
     {NUMBER_BLOCK_NOT_COMPRESSED, "rocksdb.number.block.not_compressed"},
     {MERGE_OPERATION_TOTAL_TIME, "rocksdb.merge.operation.time.nanos"},
     {FILTER_OPERATION_TOTAL_TIME, "rocksdb.filter.operation.time.nanos"},
     {ROW_CACHE_HIT, "rocksdb.row.cache.hit"},
     {ROW_CACHE_MISS, "rocksdb.row.cache.miss"},
+    {READ_AMP_ESTIMATE_USEFUL_BYTES, "rocksdb.read.amp.estimate.useful.bytes"},
+    {READ_AMP_TOTAL_READ_BYTES, "rocksdb.read.amp.total.read.bytes"},
 };
 
 /**
@@ -313,6 +340,14 @@ enum Histograms : uint32_t {
   BYTES_PER_READ,
   BYTES_PER_WRITE,
   BYTES_PER_MULTIGET,
+
+  // number of bytes compressed/decompressed
+  // number of bytes is when uncompressed; i.e. before/after respectively
+  BYTES_COMPRESSED,
+  BYTES_DECOMPRESSED,
+  COMPRESSION_TIMES_NANOS,
+  DECOMPRESSION_TIMES_NANOS,
+
   HISTOGRAM_ENUM_MAX,  // TODO(ldemailly): enforce HistogramsNameMap match
 };
 
@@ -343,6 +378,10 @@ const std::vector<std::pair<Histograms, std::string>> HistogramsNameMap = {
     {BYTES_PER_READ, "rocksdb.bytes.per.read"},
     {BYTES_PER_WRITE, "rocksdb.bytes.per.write"},
     {BYTES_PER_MULTIGET, "rocksdb.bytes.per.multiget"},
+    {BYTES_COMPRESSED, "rocksdb.bytes.compressed"},
+    {BYTES_DECOMPRESSED, "rocksdb.bytes.decompressed"},
+    {COMPRESSION_TIMES_NANOS, "rocksdb.compression.times.nanos"},
+    {DECOMPRESSION_TIMES_NANOS, "rocksdb.decompression.times.nanos"},
 };
 
 struct HistogramData {
@@ -354,6 +393,9 @@ struct HistogramData {
 };
 
 enum StatsLevel {
+  // Collect all stats except time inside mutex lock AND time spent on
+  // compression.
+  kExceptDetailedTimers,
   // Collect all stats except the counters requiring to get time inside the
   // mutex lock.
   kExceptTimeForMutex,
@@ -387,7 +429,7 @@ class Statistics {
     return type < HISTOGRAM_ENUM_MAX;
   }
 
-  StatsLevel stats_level_ = kExceptTimeForMutex;
+  StatsLevel stats_level_ = kExceptDetailedTimers;
 };
 
 // Create a concrete DBStatistics object

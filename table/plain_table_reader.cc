@@ -128,22 +128,23 @@ Status PlainTableReader::Open(const ImmutableCFOptions& ioptions,
 
   TableProperties* props = nullptr;
   auto s = ReadTableProperties(file.get(), file_size, kPlainTableMagicNumber,
-                               ioptions.env, ioptions.info_log, &props);
+                               ioptions, &props);
   if (!s.ok()) {
     return s;
   }
 
   assert(hash_table_ratio >= 0.0);
   auto& user_props = props->user_collected_properties;
-  auto prefix_extractor_in_file =
-      user_props.find(PlainTablePropertyNames::kPrefixExtractorName);
+  auto prefix_extractor_in_file = props->prefix_extractor_name;
 
-  if (!full_scan_mode && prefix_extractor_in_file != user_props.end()) {
+  if (!full_scan_mode &&
+      !prefix_extractor_in_file.empty() /* old version sst file*/
+      && prefix_extractor_in_file != "nullptr") {
     if (!ioptions.prefix_extractor) {
       return Status::InvalidArgument(
           "Prefix extractor is missing when opening a PlainTable built "
           "using a prefix extractor");
-    } else if (prefix_extractor_in_file->second.compare(
+    } else if (prefix_extractor_in_file.compare(
                    ioptions.prefix_extractor->Name()) != 0) {
       return Status::InvalidArgument(
           "Prefix extractor given doesn't match the one used to build "
@@ -293,13 +294,13 @@ Status PlainTableReader::PopulateIndex(TableProperties* props,
 
   BlockContents bloom_block_contents;
   auto s = ReadMetaBlock(file_info_.file.get(), file_size_,
-                         kPlainTableMagicNumber, ioptions_.env,
+                         kPlainTableMagicNumber, ioptions_,
                          BloomBlockBuilder::kBloomBlock, &bloom_block_contents);
   bool index_in_file = s.ok();
 
   BlockContents index_block_contents;
   s = ReadMetaBlock(
-      file_info_.file.get(), file_size_, kPlainTableMagicNumber, ioptions_.env,
+      file_info_.file.get(), file_size_, kPlainTableMagicNumber, ioptions_,
       PlainTableIndexBuilder::kPlainTableIndexBlock, &index_block_contents);
 
   index_in_file &= s.ok();

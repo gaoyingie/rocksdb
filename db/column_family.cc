@@ -71,17 +71,14 @@ Status ColumnFamilyHandleImpl::GetDescriptor(ColumnFamilyDescriptor* desc) {
 #ifndef ROCKSDB_LITE
   // accessing mutable cf-options requires db mutex.
   InstrumentedMutexLock l(mutex_);
-  *desc = ColumnFamilyDescriptor(
-      cfd()->GetName(),
-      BuildColumnFamilyOptions(*cfd()->options(),
-                               *cfd()->GetLatestMutableCFOptions()));
+  *desc = ColumnFamilyDescriptor(cfd()->GetName(), cfd()->GetLatestCFOptions());
   return Status::OK();
 #else
   return Status::NotSupported();
 #endif  // !ROCKSDB_LITE
 }
 
-const Comparator* ColumnFamilyHandleImpl::user_comparator() const {
+const Comparator* ColumnFamilyHandleImpl::GetComparator() const {
   return cfd()->user_comparator();
 }
 
@@ -204,6 +201,10 @@ ColumnFamilyOptions SanitizeOptions(const DBOptions& db_options,
     result.level0_stop_writes_trigger = std::numeric_limits<int>::max();
   }
 
+  if (result.max_bytes_for_level_multiplier <= 0) {
+    result.max_bytes_for_level_multiplier = 1;
+  }
+
   if (result.level0_file_num_compaction_trigger == 0) {
     Warn(db_options.info_log.get(),
          "level0_file_num_compaction_trigger cannot be 0");
@@ -260,6 +261,10 @@ ColumnFamilyOptions SanitizeOptions(const DBOptions& db_options,
       //    DB path work.
       result.level_compaction_dynamic_level_bytes = false;
     }
+  }
+
+  if (result.max_compaction_bytes == 0) {
+    result.max_compaction_bytes = result.target_file_size_base * 25;
   }
 
   return result;
@@ -342,7 +347,7 @@ ColumnFamilyData::ColumnFamilyData(
       options_(*db_options,
                SanitizeOptions(*db_options, &internal_comparator_, cf_options)),
       ioptions_(options_),
-      mutable_cf_options_(options_, ioptions_),
+      mutable_cf_options_(options_),
       write_buffer_manager_(write_buffer_manager),
       mem_(nullptr),
       imm_(options_.min_write_buffer_number_to_merge,
@@ -474,6 +479,10 @@ void ColumnFamilyData::SetDropped() {
   column_family_set_->RemoveColumnFamily(this);
 }
 
+ColumnFamilyOptions ColumnFamilyData::GetLatestCFOptions() const {
+  return BuildColumnFamilyOptions(options_, mutable_cf_options_);
+}
+
 const double kSlowdownRatio = 1.2;
 
 namespace {
@@ -558,8 +567,9 @@ void ColumnFamilyData::RecalculateWriteStallConditions(
           "(waiting for flush), max_write_buffer_number is set to %d",
           name_.c_str(), imm()->NumNotFlushed(),
           mutable_cf_options.max_write_buffer_number);
-    } else if (vstorage->l0_delay_trigger_count() >=
-               mutable_cf_options.level0_stop_writes_trigger) {
+    } else if (!mutable_cf_options.disable_auto_compactions &&
+               vstorage->l0_delay_trigger_count() >=
+                   mutable_cf_options.level0_stop_writes_trigger) {
       write_controller_token_ = write_controller->GetStopToken();
       internal_stats_->AddCFStats(InternalStats::LEVEL0_NUM_FILES_TOTAL, 1);
       if (compaction_picker_->IsLevel0CompactionInProgress()) {
@@ -569,7 +579,8 @@ void ColumnFamilyData::RecalculateWriteStallConditions(
       Log(InfoLogLevel::WARN_LEVEL, ioptions_.info_log,
           "[%s] Stopping writes because we have %d level-0 files",
           name_.c_str(), vstorage->l0_delay_trigger_count());
-    } else if (mutable_cf_options.hard_pending_compaction_bytes_limit > 0 &&
+    } else if (!mutable_cf_options.disable_auto_compactions &&
+               mutable_cf_options.hard_pending_compaction_bytes_limit > 0 &&
                compaction_needed_bytes >=
                    mutable_cf_options.hard_pending_compaction_bytes_limit) {
       write_controller_token_ = write_controller->GetStopToken();
@@ -594,7 +605,8 @@ void ColumnFamilyData::RecalculateWriteStallConditions(
           name_.c_str(), imm()->NumNotFlushed(),
           mutable_cf_options.max_write_buffer_number,
           write_controller->delayed_write_rate());
-    } else if (mutable_cf_options.level0_slowdown_writes_trigger >= 0 &&
+    } else if (!mutable_cf_options.disable_auto_compactions &&
+               mutable_cf_options.level0_slowdown_writes_trigger >= 0 &&
                vstorage->l0_delay_trigger_count() >=
                    mutable_cf_options.level0_slowdown_writes_trigger) {
       write_controller_token_ =
@@ -611,7 +623,8 @@ void ColumnFamilyData::RecalculateWriteStallConditions(
           "rate %" PRIu64,
           name_.c_str(), vstorage->l0_delay_trigger_count(),
           write_controller->delayed_write_rate());
-    } else if (mutable_cf_options.soft_pending_compaction_bytes_limit > 0 &&
+    } else if (!mutable_cf_options.disable_auto_compactions &&
+               mutable_cf_options.soft_pending_compaction_bytes_limit > 0 &&
                vstorage->estimated_compaction_needed_bytes() >=
                    mutable_cf_options.soft_pending_compaction_bytes_limit) {
       write_controller_token_ =
@@ -1007,8 +1020,7 @@ uint32_t GetColumnFamilyID(ColumnFamilyHandle* column_family) {
 const Comparator* GetColumnFamilyUserComparator(
     ColumnFamilyHandle* column_family) {
   if (column_family != nullptr) {
-    auto cfh = reinterpret_cast<ColumnFamilyHandleImpl*>(column_family);
-    return cfh->user_comparator();
+    return column_family->GetComparator();
   }
   return nullptr;
 }

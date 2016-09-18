@@ -165,8 +165,7 @@ class DBImpl : public DB {
   virtual const std::string& GetName() const override;
   virtual Env* GetEnv() const override;
   using DB::GetOptions;
-  virtual const Options& GetOptions(
-      ColumnFamilyHandle* column_family) const override;
+  virtual Options GetOptions(ColumnFamilyHandle* column_family) const override;
   using DB::GetDBOptions;
   virtual const DBOptions& GetDBOptions() const override;
   using DB::Flush;
@@ -252,16 +251,18 @@ class DBImpl : public DB {
   //
   // Returns OK or NotFound on success,
   // other status on unexpected error.
+  // TODO(andrewkr): this API need to be aware of range deletion operations
   Status GetLatestSequenceForKey(SuperVersion* sv, const Slice& key,
                                  bool cache_only, SequenceNumber* seq,
                                  bool* found_record_for_key);
 
   using DB::AddFile;
   virtual Status AddFile(ColumnFamilyHandle* column_family,
-                         const ExternalSstFileInfo* file_info,
-                         bool move_file) override;
+                         const std::vector<ExternalSstFileInfo>& file_info_list,
+                         bool move_file, bool skip_snapshot_check) override;
   virtual Status AddFile(ColumnFamilyHandle* column_family,
-                         const std::string& file_path, bool move_file) override;
+                         const std::vector<std::string>& file_path_list,
+                         bool move_file, bool skip_snapshot_check) override;
 
 #endif  // ROCKSDB_LITE
 
@@ -341,6 +342,8 @@ class DBImpl : public DB {
 
   uint64_t TEST_LogfileNumber();
 
+  uint64_t TEST_total_log_size() const { return total_log_size_; }
+
   // Returns column family name to ImmutableCFOptions map.
   Status TEST_GetAllImmutableCFOptions(
       std::unordered_map<std::string, const ImmutableCFOptions*>* iopts_map);
@@ -361,6 +364,10 @@ class DBImpl : public DB {
   // Return maximum background compaction allowed to be scheduled based on
   // compaction status.
   int BGCompactionsAllowed() const;
+
+  // move logs pending closing from job_context to the DB queue and
+  // schedule a purge
+  void ScheduleBgLogWriterClose(JobContext* job_context);
 
   // Returns the list of live files in 'live' and the list
   // of all files in the filesystem in 'candidate_files'.
@@ -490,6 +497,9 @@ class DBImpl : public DB {
 
   void MarkLogAsHavingPrepSectionFlushed(uint64_t log);
   void MarkLogAsContainingPrepSection(uint64_t log);
+  void AddToLogsToFreeQueue(log::Writer* log_writer) {
+    logs_to_free_queue_.push_back(log_writer);
+  }
 
   Status NewDB();
 
@@ -598,6 +608,8 @@ class DBImpl : public DB {
   // and blocked by any other pending_outputs_ calls)
   void ReleaseFileNumberFromPendingOutputs(std::list<uint64_t>::iterator v);
 
+  Status SyncClosedLogs(JobContext* job_context);
+
   // Flush the in-memory write buffer to storage.  Switches to a new
   // log-file/memtable and writes a new descriptor iff successful.
   Status FlushMemTableToOutputFile(ColumnFamilyData* cfd,
@@ -635,13 +647,17 @@ class DBImpl : public DB {
   // Finds the lowest level in the DB that the ingested file can be added to
   // REQUIRES: mutex_ held
   int PickLevelForIngestedFile(ColumnFamilyData* cfd,
-                               const ExternalSstFileInfo* file_info);
+                               const ExternalSstFileInfo& file_info);
 
   Status CompactFilesImpl(
       const CompactionOptions& compact_options, ColumnFamilyData* cfd,
       Version* version, const std::vector<std::string>& input_file_names,
       const int output_level, int output_path_id, JobContext* job_context,
       LogBuffer* log_buffer);
+  Status ReadExternalSstFileInfo(ColumnFamilyHandle* column_family,
+                                 const std::string& file_path,
+                                 ExternalSstFileInfo* file_info);
+
 #endif  // ROCKSDB_LITE
 
   ColumnFamilyData* GetColumnFamilyDataByName(const std::string& cf_name);
@@ -700,7 +716,7 @@ class DBImpl : public DB {
   //       same time.
   InstrumentedMutex options_files_mutex_;
   // State below is protected by mutex_
-  InstrumentedMutex mutex_;
+  mutable InstrumentedMutex mutex_;
 
   std::atomic<bool> shutting_down_;
   // This condition variable is signaled on these conditions:
@@ -870,6 +886,9 @@ class DBImpl : public DB {
 
   // A queue to store filenames of the files to be purged
   std::deque<PurgeFileInfo> purge_queue_;
+
+  // A queue to store log writers to close
+  std::deque<log::Writer*> logs_to_free_queue_;
   int unscheduled_flushes_;
   int unscheduled_compactions_;
 

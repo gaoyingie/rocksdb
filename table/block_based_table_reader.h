@@ -11,8 +11,9 @@
 
 #include <stdint.h>
 #include <memory>
-#include <utility>
 #include <string>
+#include <utility>
+#include <vector>
 
 #include "rocksdb/options.h"
 #include "rocksdb/persistent_cache.h"
@@ -21,6 +22,7 @@
 #include "rocksdb/table.h"
 #include "table/table_properties_internal.h"
 #include "table/table_reader.h"
+#include "util/cf_options.h"
 #include "util/coding.h"
 #include "util/file_reader_writer.h"
 
@@ -48,6 +50,8 @@ class InternalIterator;
 
 using std::unique_ptr;
 
+typedef std::vector<std::pair<std::string, std::string>> KVPairBlock;
+
 // A Table is a sorted map from strings to strings.  Tables are
 // immutable and persistent.  A Table may be safely accessed from
 // multiple threads without external synchronization.
@@ -69,17 +73,19 @@ class BlockBasedTable : public TableReader {
   // to nullptr and returns a non-ok status.
   //
   // @param file must remain live while this Table is in use.
-  // @param prefetch_index_and_filter can be used to disable prefetching of
-  //    index and filter blocks at startup
+  // @param prefetch_index_and_filter_in_cache can be used to disable
+  // prefetching of
+  //    index and filter blocks into block cache at startup
   // @param skip_filters Disables loading/accessing the filter block. Overrides
-  //    prefetch_index_and_filter, so filter will be skipped if both are set.
+  //    prefetch_index_and_filter_in_cache, so filter will be skipped if both
+  //    are set.
   static Status Open(const ImmutableCFOptions& ioptions,
                      const EnvOptions& env_options,
                      const BlockBasedTableOptions& table_options,
                      const InternalKeyComparator& internal_key_comparator,
                      unique_ptr<RandomAccessFileReader>&& file,
                      uint64_t file_size, unique_ptr<TableReader>* table_reader,
-                     bool prefetch_index_and_filter = true,
+                     bool prefetch_index_and_filter_in_cache = true,
                      bool skip_filters = false, int level = -1);
 
   bool PrefixMayMatch(const Slice& internal_key);
@@ -90,6 +96,9 @@ class BlockBasedTable : public TableReader {
   // @param skip_filters Disables loading/accessing the filter block
   InternalIterator* NewIterator(const ReadOptions&, Arena* arena = nullptr,
                                 bool skip_filters = false) override;
+
+  InternalIterator* NewRangeTombstoneIterator(
+      const ReadOptions& read_options) override;
 
   // @param skip_filters Disables loading/accessing the filter block
   Status Get(const ReadOptions& readOptions, const Slice& key,
@@ -136,6 +145,10 @@ class BlockBasedTable : public TableReader {
                            size_t cache_key_prefix_size,
                            const BlockHandle& handle, char* cache_key);
 
+  // Retrieve all key value pairs from data blocks in the table.
+  // The key retrieved are internal keys.
+  Status GetKVPairsFromDataBlocks(std::vector<KVPairBlock>* kv_pair_blocks);
+
  private:
   template <class TValue>
   struct CachableEntry;
@@ -177,10 +190,10 @@ class BlockBasedTable : public TableReader {
   //    dictionary.
   static Status GetDataBlockFromCache(
       const Slice& block_cache_key, const Slice& compressed_block_cache_key,
-      Cache* block_cache, Cache* block_cache_compressed, Statistics* statistics,
-      const ReadOptions& read_options,
+      Cache* block_cache, Cache* block_cache_compressed,
+      const ImmutableCFOptions& ioptions, const ReadOptions& read_options,
       BlockBasedTable::CachableEntry<Block>* block, uint32_t format_version,
-      const Slice& compression_dict);
+      const Slice& compression_dict, size_t read_amp_bytes_per_bit);
 
   // Put a raw block (maybe compressed) to the corresponding block caches.
   // This method will perform decompression against raw_block if needed and then
@@ -195,9 +208,9 @@ class BlockBasedTable : public TableReader {
   static Status PutDataBlockToCache(
       const Slice& block_cache_key, const Slice& compressed_block_cache_key,
       Cache* block_cache, Cache* block_cache_compressed,
-      const ReadOptions& read_options, Statistics* statistics,
+      const ReadOptions& read_options, const ImmutableCFOptions& ioptions,
       CachableEntry<Block>* block, Block* raw_block, uint32_t format_version,
-      const Slice& compression_dict);
+      const Slice& compression_dict, size_t read_amp_bytes_per_bit);
 
   // Calls (*handle_result)(arg, ...) repeatedly, starting with the entry found
   // after a call to Seek(key), until handle_result returns false.

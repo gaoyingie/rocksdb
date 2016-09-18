@@ -12,15 +12,15 @@
 #include <stdint.h>
 #include <stdio.h>
 #include <memory>
-#include <vector>
 #include <string>
 #include <unordered_map>
-#include "rocksdb/immutable_options.h"
+#include <vector>
 #include "rocksdb/iterator.h"
 #include "rocksdb/listener.h"
 #include "rocksdb/metadata.h"
 #include "rocksdb/options.h"
 #include "rocksdb/snapshot.h"
+#include "rocksdb/sst_file_writer.h"
 #include "rocksdb/thread_status.h"
 #include "rocksdb/transaction_log.h"
 #include "rocksdb/types.h"
@@ -76,6 +76,9 @@ class ColumnFamilyHandle {
   //
   // Note that this function is not supported in RocksDBLite.
   virtual Status GetDescriptor(ColumnFamilyDescriptor* desc) = 0;
+  // Returns the comparator of the column family associated with the
+  // current handle.
+  virtual const Comparator* GetComparator() const = 0;
 };
 
 static const int kMajorVersion = __ROCKSDB_MAJOR__;
@@ -146,7 +149,9 @@ class DB {
   // in rocksdb::kDefaultColumnFamilyName.
   // If everything is OK, handles will on return be the same size
   // as column_families --- handles[i] will be a handle that you
-  // will use to operate on column family column_family[i]
+  // will use to operate on column family column_family[i].
+  // Before delete DB, you have to close All column families by calling
+  // DestroyColumnFamilyHandle() with all the handles.
   static Status Open(const DBOptions& db_options, const std::string& name,
                      const std::vector<ColumnFamilyDescriptor>& column_families,
                      std::vector<ColumnFamilyHandle*>* handles, DB** dbptr);
@@ -172,6 +177,11 @@ class DB {
   // only records a drop record in the manifest and prevents the column
   // family from flushing and compacting.
   virtual Status DropColumnFamily(ColumnFamilyHandle* column_family);
+  // Close a column family specified by column_family handle and destroy
+  // the column family handle specified to avoid double deletion. This call
+  // deletes the column family handle by default. Use this method to
+  // close column family instead of deleting column family handle directly
+  virtual Status DestroyColumnFamilyHandle(ColumnFamilyHandle* column_family);
 
   // Set the database entry for "key" to "value".
   // If "key" already exists, it will be overwritten.
@@ -580,14 +590,14 @@ class DB {
   }
 
 #if defined(__GNUC__) || defined(__clang__)
-  __attribute__((deprecated))
+  __attribute__((__deprecated__))
 #elif _WIN32
   __declspec(deprecated)
 #endif
-   virtual Status
-      CompactRange(ColumnFamilyHandle* column_family, const Slice* begin,
-                   const Slice* end, bool change_level = false,
-                   int target_level = -1, uint32_t target_path_id = 0) {
+  virtual Status
+  CompactRange(ColumnFamilyHandle* column_family, const Slice* begin,
+               const Slice* end, bool change_level = false,
+               int target_level = -1, uint32_t target_path_id = 0) {
     CompactRangeOptions options;
     options.change_level = change_level;
     options.target_level = target_level;
@@ -595,14 +605,13 @@ class DB {
     return CompactRange(options, column_family, begin, end);
   }
 #if defined(__GNUC__) || defined(__clang__)
-  __attribute__((deprecated))
+  __attribute__((__deprecated__))
 #elif _WIN32
   __declspec(deprecated)
 #endif
-    virtual Status
-      CompactRange(const Slice* begin, const Slice* end,
-                   bool change_level = false, int target_level = -1,
-                   uint32_t target_path_id = 0) {
+  virtual Status
+  CompactRange(const Slice* begin, const Slice* end, bool change_level = false,
+               int target_level = -1, uint32_t target_path_id = 0) {
     CompactRangeOptions options;
     options.change_level = change_level;
     options.target_level = target_level;
@@ -687,9 +696,8 @@ class DB {
   // column family, the options provided when calling DB::Open() or
   // DB::CreateColumnFamily() will have been "sanitized" and transformed
   // in an implementation-defined manner.
-  virtual const Options& GetOptions(ColumnFamilyHandle* column_family)
-      const = 0;
-  virtual const Options& GetOptions() const {
+  virtual Options GetOptions(ColumnFamilyHandle* column_family) const = 0;
+  virtual Options GetOptions() const {
     return GetOptions(DefaultColumnFamily());
   }
 
@@ -792,32 +800,79 @@ class DB {
     GetColumnFamilyMetaData(DefaultColumnFamily(), metadata);
   }
 
-  // Load table file located at "file_path" into "column_family", a pointer to
-  // ExternalSstFileInfo can be used instead of "file_path" to do a blind add
-  // that wont need to read the file, move_file can be set to true to
-  // move the file instead of copying it.
+  // Batch load table files whose paths stored in  "file_path_list" into
+  // "column_family", a vector of  ExternalSstFileInfo can be used
+  // instead of "file_path_list" to do a blind batch add that wont
+  // need to read the file, move_file can be set to true to
+  // move the files instead of copying them, skip_snapshot_check can be set to
+  // true to ignore the snapshot, make sure that you know that when you use it,
+  // snapshots see the data that is added in the new files.
   //
   // Current Requirements:
-  // (1) Key range in loaded table file don't overlap with
+  // (1) The key ranges of the files don't overlap with each other
+  // (2) The key range of any file in list doesn't overlap with
   //     existing keys or tombstones in DB.
-  // (2) No snapshots are held.
+  // (3) No snapshots are held (check skip_snapshot_check to skip this check).
   //
-  // Notes: We will try to ingest the file to the lowest possible level
+  // Notes: We will try to ingest the files to the lowest possible level
   //        even if the file compression dont match the level compression
   virtual Status AddFile(ColumnFamilyHandle* column_family,
-                         const std::string& file_path,
-                         bool move_file = false) = 0;
-  virtual Status AddFile(const std::string& file_path, bool move_file = false) {
-    return AddFile(DefaultColumnFamily(), file_path, move_file);
+                         const std::vector<std::string>& file_path_list,
+                         bool move_file = false, bool skip_snapshot_check = false) = 0;
+  virtual Status AddFile(const std::vector<std::string>& file_path_list,
+                         bool move_file = false, bool skip_snapshot_check = false) {
+    return AddFile(DefaultColumnFamily(), file_path_list, move_file, skip_snapshot_check);
+  }
+#if defined(__GNUC__) || defined(__clang__)
+  __attribute__((__deprecated__))
+#elif _WIN32
+  __declspec(deprecated)
+#endif
+  virtual Status
+  AddFile(ColumnFamilyHandle* column_family, const std::string& file_path,
+          bool move_file = false, bool skip_snapshot_check = false) {
+    return AddFile(column_family, std::vector<std::string>(1, file_path),
+                   move_file, skip_snapshot_check);
+  }
+#if defined(__GNUC__) || defined(__clang__)
+  __attribute__((__deprecated__))
+#elif _WIN32
+  __declspec(deprecated)
+#endif
+  virtual Status
+  AddFile(const std::string& file_path, bool move_file = false, bool skip_snapshot_check = false) {
+    return AddFile(DefaultColumnFamily(),
+                   std::vector<std::string>(1, file_path), move_file, skip_snapshot_check);
   }
 
   // Load table file with information "file_info" into "column_family"
   virtual Status AddFile(ColumnFamilyHandle* column_family,
-                         const ExternalSstFileInfo* file_info,
-                         bool move_file = false) = 0;
-  virtual Status AddFile(const ExternalSstFileInfo* file_info,
-                         bool move_file = false) {
-    return AddFile(DefaultColumnFamily(), file_info, move_file);
+                         const std::vector<ExternalSstFileInfo>& file_info_list,
+                         bool move_file = false, bool skip_snapshot_check = false) = 0;
+  virtual Status AddFile(const std::vector<ExternalSstFileInfo>& file_info_list,
+                         bool move_file = false, bool skip_snapshot_check = false) {
+    return AddFile(DefaultColumnFamily(), file_info_list, move_file, skip_snapshot_check);
+  }
+#if defined(__GNUC__) || defined(__clang__)
+  __attribute__((__deprecated__))
+#elif _WIN32
+  __declspec(deprecated)
+#endif
+  virtual Status
+  AddFile(ColumnFamilyHandle* column_family,
+          const ExternalSstFileInfo* file_info, bool move_file = false, bool skip_snapshot_check = false) {
+    return AddFile(column_family,
+                   std::vector<ExternalSstFileInfo>(1, *file_info), move_file, skip_snapshot_check);
+  }
+#if defined(__GNUC__) || defined(__clang__)
+  __attribute__((__deprecated__))
+#elif _WIN32
+  __declspec(deprecated)
+#endif
+  virtual Status
+  AddFile(const ExternalSstFileInfo* file_info, bool move_file = false, bool skip_snapshot_check = false) {
+    return AddFile(DefaultColumnFamily(),
+                   std::vector<ExternalSstFileInfo>(1, *file_info), move_file, skip_snapshot_check);
   }
 
 #endif  // ROCKSDB_LITE

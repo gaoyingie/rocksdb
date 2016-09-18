@@ -518,6 +518,9 @@ bool AreEqualOptions(
     case OptionType::kInt:
       return (*reinterpret_cast<const int*>(offset1) ==
               *reinterpret_cast<const int*>(offset2));
+    case OptionType::kVectorInt:
+      return (*reinterpret_cast<const std::vector<int>*>(offset1) ==
+              *reinterpret_cast<const std::vector<int>*>(offset2));
     case OptionType::kUInt:
       return (*reinterpret_cast<const unsigned int*>(offset1) ==
               *reinterpret_cast<const unsigned int*>(offset2));
@@ -756,6 +759,7 @@ Status RocksDBOptionsParser::VerifyBlockBasedTableFactory(
   if (base_tf == nullptr) {
     return Status::OK();
   }
+  assert(file_tf != nullptr);
 
   const auto& base_opt = base_tf->table_options();
   const auto& file_opt = file_tf->table_options();

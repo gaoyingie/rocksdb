@@ -78,10 +78,10 @@
 #include "rocksdb/comparator.h"
 #include "rocksdb/db.h"
 #include "rocksdb/env.h"
-#include "rocksdb/immutable_options.h"
 #include "rocksdb/options.h"
 #include "rocksdb/write_buffer_manager.h"
 #include "table/scoped_arena_iterator.h"
+#include "util/cf_options.h"
 #include "util/file_reader_writer.h"
 #include "util/string_util.h"
 
@@ -141,7 +141,7 @@ class Repairer {
                                 cf_name + ", id=" + ToString(cf_id));
     }
     Options opts(db_options_, *cf_opts);
-    MutableCFOptions mut_cf_opts(opts, ImmutableCFOptions(opts));
+    MutableCFOptions mut_cf_opts(opts);
 
     VersionEdit edit;
     edit.SetComparatorName(opts.comparator->Name());

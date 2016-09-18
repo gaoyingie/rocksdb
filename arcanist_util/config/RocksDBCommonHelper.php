@@ -62,7 +62,9 @@ function getSteps($applyDiff, $diffID, $username, $test) {
     assert(strlen($diffID) > 0);
     assert(is_numeric($diffID));
 
-    $arcrc_content = exec("cat ~/.arcrc | gzip -f | base64 -w0");
+    $arcrc_content = (PHP_OS == "Darwin" ?
+        exec("cat ~/.arcrc | gzip -f | base64") :
+            exec("cat ~/.arcrc | gzip -f | base64 -w0"));
     assert(strlen($arcrc_content) > 0);
 
     // Sandcastle machines don't have arc setup. We copy the user certificate
@@ -75,9 +77,10 @@ function getSteps($applyDiff, $diffID, $username, $test) {
     );
 
     // arc demands certain permission on its config.
+    // also fix the sticky bit issue in sandcastle
     $fix_permission = array(
       "name" => "Fix environment",
-      "shell" => "chmod 600 ~/.arcrc",
+      "shell" => "chmod 600 ~/.arcrc && chmod +t /dev/shm",
       "user" => "root"
     );
 
@@ -115,7 +118,7 @@ function getSteps($applyDiff, $diffID, $username, $test) {
   }
 
   // Run the actual command.
-  $cmd = $cmd . "./build_tools/precommit_checker.py " . $test
+  $cmd = $cmd . "J=$(nproc) ./build_tools/precommit_checker.py " . $test
            . "; exit_code=$?; ";
 
   if ($applyDiff) {
@@ -125,15 +128,31 @@ function getSteps($applyDiff, $diffID, $username, $test) {
                 . "; ";
   }
 
+  // shell command to sort the tests based on exit code and print
+  // the output of the log files.
+  $cat_sorted_logs = "
+    while read code log_file;
+      do echo \"################ cat \$log_file [exit_code : \$code] ################\";
+      cat \$log_file;
+    done < <(tail -n +2 LOG | sort -k7,7n -k4,4gr | awk '{print \$7,\$NF}')";
+
+  // Shell command to cat all log files
+  $cat_all_logs = "for f in `ls t/!(run-*)`; do echo \$f;cat \$f; done";
+
+  // If LOG file exist use it to cat log files sorted by exit code, otherwise
+  // cat everything
+  $logs_cmd = "if [ -f LOG ]; then {$cat_sorted_logs}; else {$cat_all_logs}; fi";
+
   $cmd = $cmd . " cat /tmp/precommit-check.log"
-           . "; for f in `ls t/log-*`; do echo \$f; cat \$f; done;"
-           . "[[ \$exit_code -eq 0 ]]";
+              . "; shopt -s extglob; {$logs_cmd}"
+              . "; shopt -u extglob; [[ \$exit_code -eq 0 ]]";
   assert(strlen($cmd) > 0);
 
   $run_test = array(
     "name" => "Run " . $test,
     "shell" => $cmd,
     "user" => "root",
+    "parser" => "python build_tools/error_filter.py " . $test,
   );
 
   $steps[] = $run_test;
@@ -212,21 +231,11 @@ function getSandcastleConfig() {
     assert(is_numeric($diffID));
   }
 
-  if (strcmp(getenv("ROCKSDB_CHECK_ALL"), 1) == 0) {
-    // Extract all tests from the CI definition.
-    $output = file_get_contents("build_tools/rocksdb-lego-determinator");
-    assert(strlen($output) > 0);
-
-    preg_match_all('/[ ]{2}([a-zA-Z0-9_]+)[\)]{1}/', $output, $matches);
-    $tests = $matches[1];
-    assert(count($tests) > 0);
-  } else {
-    // Manually list of tests we want to run in Sandcastle.
-    $tests = array(
-      "unit", "unit_481", "clang_unit", "tsan", "asan", "lite_test",
-      "valgrind"
-    );
-  }
+  // List of tests we want to run in Sandcastle.
+  $tests = array("unit", "unit_non_shm", "unit_481", "clang_unit", "tsan",
+                 "asan", "lite_test", "valgrind", "release", "release_481",
+                 "clang_release", "punit", "clang_analyze", "code_cov",
+                 "java_build", "no_compression", "unity", "ubsan");
 
   $send_email_template = array(
     'type' => 'email',
@@ -255,7 +264,9 @@ function getSandcastleConfig() {
   // execute. Why compress the job definitions? Otherwise we run over the max
   // string size.
   $cmd = "echo " . base64_encode(json_encode($arg))
-         . " | gzip -f | base64 -w0";
+         . (PHP_OS == "Darwin" ?
+             " | gzip -f | base64" :
+                 " | gzip -f | base64 -w0");
   assert(strlen($cmd) > 0);
 
   $arg_encoded = shell_exec($cmd);

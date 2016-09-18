@@ -71,7 +71,7 @@ class InternalIterator : public Cleanable {
   virtual void SetPinnedItersMgr(PinnedIteratorsManager* pinned_iters_mgr) {}
 
   // If true, this means that the Slice returned by key() is valid as long as
-  // PinnedIteratorsManager::ReleasePinnedIterators is not called and the
+  // PinnedIteratorsManager::ReleasePinnedData is not called and the
   // Iterator is not deleted.
   //
   // IsKeyPinned() is guaranteed to always return true if
@@ -79,6 +79,11 @@ class InternalIterator : public Cleanable {
   //  - DB tables were created with BlockBasedTableOptions::use_delta_encoding
   //    set to false.
   virtual bool IsKeyPinned() const { return false; }
+
+  // If true, this means that the Slice returned by value() is valid as long as
+  // PinnedIteratorsManager::ReleasePinnedData is not called and the
+  // Iterator is not deleted.
+  virtual bool IsValuePinned() const { return false; }
 
   virtual Status GetProperty(std::string prop_name, std::string* prop) {
     return Status::NotSupported("");
